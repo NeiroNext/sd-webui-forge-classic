@@ -145,9 +145,7 @@ function setupExtraNetworksForTab(tabname) {
             parent.appendChild(frag);
         };
 
-        search.addEventListener("input", function () {
-            applyFilter();
-        });
+        onEdit(tabname_full + "_search", search, 200, () => applyFilter());
         applySort();
         applyFilter();
 
