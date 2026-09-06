@@ -145,8 +145,10 @@ function setupExtraNetworksForTab(tabname) {
             parent.appendChild(frag);
         };
 
+        let searchTimer = null;
         search.addEventListener("input", function () {
-            applyFilter();
+            clearTimeout(searchTimer);
+            searchTimer = setTimeout(applyFilter, 200);
         });
         applySort();
         applyFilter();
