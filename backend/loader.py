@@ -443,6 +443,9 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 logger.info(f"Using Detected Model Data Type: {_log}")
                 if state_dict_dtype == "gguf":
                     beautiful_print_gguf_state_dict_statics(state_dict)
+                elif state_dict_dtype in ["nf4", "fp4"] and not backend.args.dynamic_args.online_lora:
+                    logger.warning(f"{state_dict_dtype} requires fp16 LoRA ; overriding option")
+                    backend.args.dynamic_args.online_lora = True
             else:
                 if override_dtype is not None:
                     storage_dtype = override_dtype
