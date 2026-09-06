@@ -1,6 +1,7 @@
 import json
 import math
 import os.path
+import struct
 
 import safetensors
 import torch
@@ -58,6 +59,46 @@ def read_arbitrary_config(directory: os.PathLike) -> dict:
     return config_data
 
 
+SAFETENSORS_DTYPES = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
+
+def read_safetensors(ckpt: str, device: torch.device) -> tuple[dict[str, torch.Tensor], dict | None]:
+    """
+    Plain file reads instead of `safe_open`: the mmap path commits the whole file (twice, with the copies)
+    and, when the commit limit runs out on Windows, crashes the process instead of raising
+    """
+    with open(ckpt, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header: dict = json.loads(f.read(n))
+        metadata = header.pop("__metadata__", None)
+
+        sd = {}
+        for k, h in sorted(header.items(), key=lambda kv: kv[1]["data_offsets"][0]):
+            start, end = h["data_offsets"]
+            dtype = SAFETENSORS_DTYPES[h["dtype"]]
+            if end > start:
+                f.seek(8 + n + start)
+                tensor = torch.frombuffer(bytearray(f.read(end - start)), dtype=torch.uint8).view(dtype).reshape(h["shape"])
+            else:
+                tensor = torch.empty(h["shape"], dtype=dtype)
+            sd[k] = tensor if device.type == "cpu" else tensor.to(device)
+
+    return sd, metadata
+
+
 def load_torch_file(ckpt: str, *, safe_load=True, device=None, return_metadata=False) -> dict[str, torch.Tensor]:
     """https://github.com/Comfy-Org/ComfyUI/blob/v0.10.0/comfy/utils.py#L59"""
 
@@ -66,15 +107,15 @@ def load_torch_file(ckpt: str, *, safe_load=True, device=None, return_metadata=F
 
     if ckpt.lower().endswith((".safetensors", ".sft")):
         try:
-            with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
-                sd = {}
-                for k in f.keys():
-                    tensor = f.get_tensor(k)
-                    if DISABLE_MMAP:
-                        tensor = tensor.to(device=device, copy=True)
-                    sd[k] = tensor
-                if return_metadata:
-                    metadata = f.metadata()
+            if DISABLE_MMAP:
+                sd, metadata = read_safetensors(ckpt, device)
+                if not return_metadata:
+                    metadata = None
+            else:
+                with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
+                    sd = {k: f.get_tensor(k) for k in f.keys()}
+                    if return_metadata:
+                        metadata = f.metadata()
         except Exception:
             raise ValueError(f'\nModel "{ckpt}" is corrupt or invalid...\nPlease download the model again\n') from None
 
