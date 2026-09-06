@@ -118,10 +118,13 @@ def dequantize_nf4(weight: torch.Tensor) -> torch.Tensor:
         absmax2 = data[weight.packed_bytes + n :].view(torch.float32)
         absmax = _blockwise(weight.nested["code"][codes.long()], absmax2, weight.nested["blocksize"]) + weight.nested["offset"]
 
-    # one 256-entry table gives both nibbles of a byte at once: [256, 2] = (high, low) in the computation dtype
-    code = weight.code.to(dtype)
+    # one 256-entry table gives both nibbles of a byte at once: [256, 2] = (high, low)
+    # bf16 has too few mantissa bits for the blockwise multiply (~4e-3 relative error), do it in fp32 like bitsandbytes;
+    # fp16 stays fp16, the error is 2.4e-4 (measured) and it halves the traffic on GPUs without fast fp32
+    math_dtype = torch.float32 if dtype == torch.bfloat16 else dtype
+    code = weight.code.to(math_dtype)
     byte = torch.arange(256, device=data.device)
     table = torch.stack([code[byte >> 4], code[byte & 0x0F]], dim=1)
     values = table.index_select(0, packed.int()).view(-1)[: weight.real_shape.numel()]
 
-    return _blockwise(values, absmax.to(dtype), weight.blocksize).reshape(weight.real_shape)
+    return _blockwise(values, absmax.to(math_dtype), weight.blocksize).reshape(weight.real_shape).to(dtype)
