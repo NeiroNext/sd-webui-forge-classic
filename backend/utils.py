@@ -99,6 +99,13 @@ def read_safetensors(ckpt: str, device: torch.device) -> tuple[dict[str, torch.T
     return sd, metadata
 
 
+def is_4bit_safetensors(ckpt: str) -> bool:
+    """bitsandbytes NF4 / FP4 checkpoint: read it without mmap (see read_safetensors), it is copied into new buffers anyway"""
+    with open(ckpt, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        return b"bitsandbytes__nf4" in (head := f.read(n)) or b"bitsandbytes__fp4" in head
+
+
 def load_torch_file(ckpt: str, *, safe_load=True, device=None, return_metadata=False) -> dict[str, torch.Tensor]:
     """https://github.com/Comfy-Org/ComfyUI/blob/v0.10.0/comfy/utils.py#L59"""
 
@@ -107,7 +114,7 @@ def load_torch_file(ckpt: str, *, safe_load=True, device=None, return_metadata=F
 
     if ckpt.lower().endswith((".safetensors", ".sft")):
         try:
-            if DISABLE_MMAP:
+            if DISABLE_MMAP or is_4bit_safetensors(ckpt):
                 sd, metadata = read_safetensors(ckpt, device)
                 if not return_metadata:
                     metadata = None
