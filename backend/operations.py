@@ -404,8 +404,7 @@ class ForgeOperationsNF4(ForgeOperations):
 
         def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
             if hasattr(self, "dummy"):
-                if (computation_dtype := self.dummy["dtype"]) not in [torch.float16, torch.bfloat16]:
-                    computation_dtype = torch.float16
+                computation_dtype = self.dummy["dtype"]
 
                 if (weight := load_nf4_parameter(state_dict, prefix + "weight", self.dummy["device"], computation_dtype)) is not None:
                     self.weight = weight
@@ -427,10 +426,9 @@ class ForgeOperationsNF4(ForgeOperations):
             return self
 
         def forward(self, x):
-            if self.bias is not None and self.bias.dtype != x.dtype:
-                self.bias = utils.tensor2parameter(self.bias.to(x.dtype))
-
-            weight, bias, signal = weights_manual_cast(self, x, weight_fn=dequantize_nf4, skip_bias_dtype=True)
+            # never replace self.bias here: the memory manager may have pinned it (cudaHostRegister), and a freed
+            # registered buffer reused by a new tensor makes the next async copy fail; cast it per call instead
+            weight, bias, signal = weights_manual_cast(self, x, weight_fn=dequantize_nf4)
             with main_stream_worker(weight, bias, signal):
                 return torch.nn.functional.linear(x, weight, bias)
 
