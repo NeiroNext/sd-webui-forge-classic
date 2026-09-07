@@ -70,6 +70,14 @@ def load_nf4_parameter(state_dict: dict, key: str, device: torch.device, computa
     absmax = state_dict[f"{key}.absmax"]
     nested = None
 
+    def aligned(*parts):  # float32 sections must start at a multiple of 4 bytes to be viewed back
+        out = []
+        for part in parts:
+            if out and (pad := -sum(x.numel() for x in out) % 4):
+                out.append(torch.zeros(pad, dtype=torch.uint8, device=part.device))
+            out.append(part.reshape(-1).view(torch.uint8))
+        return torch.cat(out)
+
     if "nested_absmax" in meta or f"{key}.nested_absmax" in state_dict:
         # double quantization: absmax itself is stored as uint8 codes, scaled blockwise by nested_absmax
         nested = {
@@ -78,9 +86,9 @@ def load_nf4_parameter(state_dict: dict, key: str, device: torch.device, computa
             "offset": float(meta["nested_offset"]),
             "absmax_bytes": absmax.numel(),
         }
-        buffer = torch.cat([packed, absmax.reshape(-1).view(torch.uint8), state_dict[f"{key}.nested_absmax"].to(torch.float32).reshape(-1).view(torch.uint8)])
+        buffer = aligned(packed, absmax, state_dict[f"{key}.nested_absmax"].to(torch.float32))
     else:
-        buffer = torch.cat([packed, absmax.to(torch.float32).reshape(-1).view(torch.uint8)])
+        buffer = aligned(packed, absmax.to(torch.float32))
 
     param = ParameterNF4(
         buffer.to(device),
@@ -110,12 +118,14 @@ def dequantize_nf4(weight: torch.Tensor) -> torch.Tensor:
     dtype = weight.computation_dtype
     packed = data[: weight.packed_bytes]
 
+    align = lambda n: (n + 3) // 4 * 4
     if weight.nested is None:
-        absmax = data[weight.packed_bytes :].view(torch.float32)
+        absmax = data[align(weight.packed_bytes) :].view(torch.float32)
     else:
+        start = align(weight.packed_bytes)
         n = weight.nested["absmax_bytes"]
-        codes = data[weight.packed_bytes : weight.packed_bytes + n]
-        absmax2 = data[weight.packed_bytes + n :].view(torch.float32)
+        codes = data[start : start + n]
+        absmax2 = data[align(start + n) :].view(torch.float32)
         absmax = _blockwise(weight.nested["code"][codes.long()], absmax2, weight.nested["blocksize"]) + weight.nested["offset"]
 
     # one 256-entry table gives both nibbles of a byte at once: [256, 2] = (high, low)
