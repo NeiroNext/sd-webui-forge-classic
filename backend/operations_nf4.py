@@ -102,6 +102,22 @@ def load_nf4_parameter(state_dict: dict, key: str, device: torch.device, computa
     return param
 
 
+def with_4bit_shapes(state_dict: dict) -> dict:
+    """
+    For architecture detection: packed 4-bit weights have shape [numel/2, 1], so return a shallow copy
+    where each of them is replaced by an empty meta tensor of the real shape (from the quant state)
+    """
+    keys = [k for k in state_dict if any(k.endswith(q) for q in QUANT_STATE_KEYS)]
+    if not keys:
+        return state_dict
+
+    sd = dict(state_dict)
+    for k in keys:
+        meta = json.loads(bytes(state_dict[k].tolist()).decode())
+        sd[k.split(".weight.")[0] + ".weight"] = torch.empty(meta["shape"], dtype=torch.bfloat16, device="meta")
+    return sd
+
+
 def _blockwise(values: torch.Tensor, absmax: torch.Tensor, blocksize: int) -> torch.Tensor:
     full = (values.numel() // blocksize) * blocksize
     out = values[:full].view(-1, blocksize) * absmax[: full // blocksize].view(-1, 1)
