@@ -44,7 +44,7 @@ class BlockCacheForForge(scripts.Script):
 
         return [enabled, threshold, warmup, max_consecutive, keep_last]
 
-    def process_before_every_sampling(self, p, enabled: bool, threshold: float, warmup: int, max_consecutive: int, keep_last: bool, **kwargs):
+    def process_before_every_sampling(self, p, enabled: bool = False, threshold: float = 0.0, warmup: int = 2, max_consecutive: int = 3, keep_last: bool = True, **kwargs):
         if BlockCacheForForge.hook is not None:
             BlockCacheForForge.hook.remove()
             BlockCacheForForge.hook = None
