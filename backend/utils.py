@@ -1,5 +1,6 @@
 import json
 import math
+import mmap
 import os.path
 import struct
 
@@ -45,6 +46,7 @@ logger.debug("Models will always be loaded safely")
 
 MMAP_TORCH_FILES = args.mmap_torch_files
 DISABLE_MMAP = args.disable_mmap
+MAP_SAFETENSORS = args.map_safetensors and not args.disable_mmap
 
 
 def read_arbitrary_config(directory: os.PathLike) -> dict:
@@ -99,6 +101,30 @@ def read_safetensors(ckpt: str, device: torch.device) -> tuple[dict[str, torch.T
     return sd, metadata
 
 
+def map_safetensors(ckpt: str, device: torch.device) -> tuple[dict[str, torch.Tensor], dict | None]:
+    """
+    Tensors as views into one copy-on-write mapping of the file. `safe_open` maps it the same way, but
+    while it does, Windows is charged twice the file size in commit; a plain read costs the read instead
+    """
+    with open(ckpt, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header: dict = json.loads(f.read(n))
+        metadata = header.pop("__metadata__", None)
+        view = memoryview(mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_COPY))
+
+    sd = {}
+    for k, h in header.items():
+        start, end = h["data_offsets"]
+        dtype = SAFETENSORS_DTYPES[h["dtype"]]
+        if end > start:
+            tensor = torch.frombuffer(view, dtype=torch.uint8, count=end - start, offset=8 + n + start).view(dtype).reshape(h["shape"])
+        else:
+            tensor = torch.empty(h["shape"], dtype=dtype)
+        sd[k] = tensor if device.type == "cpu" else tensor.to(device)
+
+    return sd, metadata
+
+
 def is_4bit_safetensors(ckpt: str) -> bool:
     """bitsandbytes NF4 / FP4 checkpoint: read it without mmap (see read_safetensors), it is copied into new buffers anyway"""
     with open(ckpt, "rb") as f:
@@ -114,15 +140,22 @@ def load_torch_file(ckpt: str, *, safe_load=True, device=None, return_metadata=F
 
     if ckpt.lower().endswith((".safetensors", ".sft")):
         try:
+            sd = None
             if DISABLE_MMAP or is_4bit_safetensors(ckpt):
                 sd, metadata = read_safetensors(ckpt, device)
-                if not return_metadata:
-                    metadata = None
-            else:
+            elif MAP_SAFETENSORS:
+                try:
+                    sd, metadata = map_safetensors(ckpt, device)
+                except Exception as e:
+                    logger.warning(f'Cannot map "{os.path.basename(ckpt)}" ({e}) ; reading it through safe_open')
+
+            if sd is None:
                 with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
                     sd = {k: f.get_tensor(k) for k in f.keys()}
                     if return_metadata:
                         metadata = f.metadata()
+            elif not return_metadata:
+                metadata = None
         except Exception:
             raise ValueError(f'\nModel "{ckpt}" is corrupt or invalid...\nPlease download the model again\n') from None
 
