@@ -59,15 +59,20 @@ class ParameterNF4(torch.nn.Parameter):
         return self.copy_with_data(torch.Tensor.pin_memory(self, device=device))
 
 
-def load_nf4_parameter(state_dict: dict, key: str, device: torch.device, computation_dtype: torch.dtype) -> ParameterNF4 | None:
-    """Build a ParameterNF4 from the `<key>` and `<key>.*` entries of a bitsandbytes checkpoint; None if `<key>` is not 4-bit"""
+def load_nf4_parameter(state_dict: dict, key: str, device: torch.device, computation_dtype: torch.dtype, consume: bool = False) -> ParameterNF4 | None:
+    """
+    Build a ParameterNF4 from the `<key>` and `<key>.*` entries of a bitsandbytes checkpoint; None if `<key>` is not 4-bit.
+    With `consume` the entries are dropped from `state_dict` as they are read, so each layer is freed as soon as it is packed.
+    """
     qs_key = next((f"{key}.{k}" for k in QUANT_STATE_KEYS if f"{key}.{k}" in state_dict), None)
     if qs_key is None:
         return None
 
-    meta = json.loads(bytes(state_dict[qs_key].tolist()).decode())
-    packed = state_dict[key].reshape(-1)
-    absmax = state_dict[f"{key}.absmax"]
+    take = state_dict.pop if consume else state_dict.__getitem__
+
+    meta = json.loads(bytes(take(qs_key).tolist()).decode())
+    packed = take(key).reshape(-1)
+    absmax = take(f"{key}.absmax")
     nested = None
 
     def aligned(*parts):  # float32 sections must start at a multiple of 4 bytes to be viewed back
@@ -81,12 +86,12 @@ def load_nf4_parameter(state_dict: dict, key: str, device: torch.device, computa
     if "nested_absmax" in meta or f"{key}.nested_absmax" in state_dict:
         # double quantization: absmax itself is stored as uint8 codes, scaled blockwise by nested_absmax
         nested = {
-            "code": state_dict[f"{key}.nested_quant_map"].to(torch.float32),
+            "code": take(f"{key}.nested_quant_map").to(torch.float32),
             "blocksize": int(meta["nested_blocksize"]),
             "offset": float(meta["nested_offset"]),
             "absmax_bytes": absmax.numel(),
         }
-        buffer = aligned(packed, absmax, state_dict[f"{key}.nested_absmax"].to(torch.float32))
+        buffer = aligned(packed, absmax, take(f"{key}.nested_absmax").to(torch.float32))
     else:
         buffer = aligned(packed, absmax.to(torch.float32))
 
@@ -94,12 +99,26 @@ def load_nf4_parameter(state_dict: dict, key: str, device: torch.device, computa
         buffer.to(device),
         real_shape=meta["shape"],
         blocksize=int(meta["blocksize"]),
-        code=state_dict[f"{key}.quant_map"].to(device=device, dtype=torch.float32),
+        code=take(f"{key}.quant_map").to(device=device, dtype=torch.float32),
         packed_bytes=packed.numel(),
         nested=nested,
     )
     param.computation_dtype = computation_dtype
     return param
+
+
+def pack_4bit_parameters(state_dict: dict, device: torch.device = None) -> None:
+    """
+    Replace the several tensors bitsandbytes stores per weight with one ParameterNF4 each, in place.
+
+    Done before `Module.load_state_dict`, which hands every submodule its own copy of the dict: those copies
+    keep the raw tensors alive, so packing during the load holds the whole component in memory next to the
+    buffers being built. Consuming the entries here frees each layer as soon as it is packed.
+    """
+    device = device or torch.device("cpu")
+    for key in [k for k in list(state_dict) if any(f"{k}.{q}" in state_dict for q in QUANT_STATE_KEYS)]:
+        if (param := load_nf4_parameter(state_dict, key, device, torch.float16, consume=True)) is not None:
+            state_dict[key] = param
 
 
 def with_4bit_shapes(state_dict: dict) -> dict:

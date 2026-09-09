@@ -391,7 +391,7 @@ class ForgeOperations:
 
 
 from backend.operations_gguf import dequantize_tensor
-from backend.operations_nf4 import dequantize_nf4, load_nf4_parameter
+from backend.operations_nf4 import ParameterNF4, dequantize_nf4, load_nf4_parameter
 
 
 class ForgeOperationsNF4(ForgeOperations):
@@ -406,7 +406,10 @@ class ForgeOperationsNF4(ForgeOperations):
             if hasattr(self, "dummy"):
                 computation_dtype = self.dummy["dtype"]
 
-                if (weight := load_nf4_parameter(state_dict, prefix + "weight", self.dummy["device"], computation_dtype)) is not None:
+                if isinstance(w := state_dict.get(prefix + "weight"), ParameterNF4):
+                    w.computation_dtype = computation_dtype  # already packed by pack_4bit_parameters
+                    self.weight = w if w.device == self.dummy["device"] else w.to(self.dummy["device"])
+                elif (weight := load_nf4_parameter(state_dict, prefix + "weight", self.dummy["device"], computation_dtype)) is not None:
                     self.weight = weight
                 elif prefix + "weight" in state_dict:
                     self.weight = utils.tensor2parameter(state_dict[prefix + "weight"].to(device=self.dummy["device"], dtype=computation_dtype))
