@@ -52,6 +52,13 @@ setup_logger(logger)
 HF = os.path.join(os.path.dirname(__file__), "huggingface")
 
 
+def vae_device(state_dict) -> torch.device:
+    # the VAE ops carry extra_dtype="vae", so using_forge_operations() never picks meta for them on its own
+    if memory_management.vae_dtype() == utils.weight_dtype(state_dict):
+        return torch.device("meta")
+    return memory_management.cpu
+
+
 def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_path, state_dict):
     config_path = os.path.join(repo_path, component_name)
 
@@ -99,7 +106,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             config = IntegratedAutoencoderKL.load_config(config_path)
 
             with no_init_weights():
-                with using_forge_operations(device=memory_management.cpu, dtype=memory_management.vae_dtype(), extra_dtype="vae"):
+                with using_forge_operations(device=vae_device(state_dict), dtype=memory_management.vae_dtype(), extra_dtype="vae"):
                     model = IntegratedAutoencoderKL.from_config(config)
 
             load_state_dict(model, state_dict, ignore_start="loss.")
@@ -114,7 +121,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 config["dch"] = 96
 
             with no_init_weights():
-                with using_forge_operations(device=memory_management.cpu, dtype=memory_management.vae_dtype(), extra_dtype="vae"):
+                with using_forge_operations(device=vae_device(state_dict), dtype=memory_management.vae_dtype(), extra_dtype="vae"):
                     model = AutoencoderKLFlux2.from_config(config)
 
             load_state_dict(model, state_dict, ignore_start="loss.")
@@ -133,7 +140,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
                 config = WanVAE.load_config(config_path)
 
             with no_init_weights():
-                with using_forge_operations(device=memory_management.cpu, dtype=memory_management.vae_dtype(), extra_dtype="vae"):
+                with using_forge_operations(device=vae_device(state_dict), dtype=memory_management.vae_dtype(), extra_dtype="vae"):
                     model = WanVAE.from_config(config)
 
             load_state_dict(model, state_dict)
