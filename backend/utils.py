@@ -125,6 +125,66 @@ def map_safetensors(ckpt: str, device: torch.device) -> tuple[dict[str, torch.Te
     return sd, metadata
 
 
+def read_4bit_safetensors(ckpt: str, device: torch.device) -> tuple[dict[str, torch.Tensor], dict | None]:
+    """
+    Read one bitsandbytes weight at a time, straight into a single arena buffer. Reading the whole file
+    and packing afterwards keeps every raw tensor alive next to its packed copy; packing into a block per
+    weight then costs another 60%, which is what the Windows allocator charges for ~20 MB blocks (0.3% for one big one)
+    """
+    from backend.operations_nf4 import QUANT_STATE_KEYS, load_nf4_parameter, packed_size
+
+    with open(ckpt, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header: dict = json.loads(f.read(n))
+        metadata = header.pop("__metadata__", None)
+        data = 8 + n
+
+        def span(k: str) -> int:
+            start, end = header[k]["data_offsets"]
+            return end - start
+
+        def read(k: str) -> torch.Tensor:
+            h = header[k]
+            start, end = h["data_offsets"]
+            dtype = SAFETENSORS_DTYPES[h["dtype"]]
+            if end <= start:
+                return torch.empty(h["shape"], dtype=dtype)
+            f.seek(data + start)
+            return torch.frombuffer(bytearray(f.read(end - start)), dtype=torch.uint8).view(dtype).reshape(h["shape"])
+
+        quantized = {k[: -len(q) - 1] for k in header for q in QUANT_STATE_KEYS if k.endswith(f".{q}")}
+        group_of = {}
+        for k in header:
+            base = k
+            while base and base not in quantized:  # strip ".absmax", ".quant_state.bitsandbytes__nf4", ...
+                base = base.rpartition(".")[0]
+            if base:
+                group_of.setdefault(base, []).append(k)
+
+        plan, total = {}, 0
+        for base in quantized:
+            total += -total % 4
+            nested = span(f"{base}.nested_absmax") if f"{base}.nested_absmax" in header else 0
+            plan[base] = (total, packed_size(span(base), span(f"{base}.absmax"), nested))
+            total += plan[base][1]
+
+        arena = torch.empty(total, dtype=torch.uint8) if device.type == "cpu" else None
+
+        sd = {}
+        for base in sorted(quantized, key=lambda b: header[b]["data_offsets"][0]):
+            group = {k: read(k) for k in sorted(group_of[base], key=lambda k: header[k]["data_offsets"][0])}
+            at, size = plan[base]
+            param = load_nf4_parameter(group, base, device, torch.float16, consume=True, out=None if arena is None else arena[at : at + size])
+            param.arena = arena
+            sd[base] = param
+
+        for k in sorted(set(header) - {k for keys in group_of.values() for k in keys}, key=lambda key: header[key]["data_offsets"][0]):
+            tensor = read(k)
+            sd[k] = tensor if device.type == "cpu" else tensor.to(device)
+
+    return sd, metadata
+
+
 def is_4bit_safetensors(ckpt: str) -> bool:
     """bitsandbytes NF4 / FP4 checkpoint: read it without mmap (see read_safetensors), it is copied into new buffers anyway"""
     with open(ckpt, "rb") as f:
@@ -141,7 +201,9 @@ def load_torch_file(ckpt: str, *, safe_load=True, device=None, return_metadata=F
     if ckpt.lower().endswith((".safetensors", ".sft")):
         try:
             sd = None
-            if DISABLE_MMAP or is_4bit_safetensors(ckpt):
+            if is_4bit_safetensors(ckpt):
+                sd, metadata = read_4bit_safetensors(ckpt, device)
+            elif DISABLE_MMAP:
                 sd, metadata = read_safetensors(ckpt, device)
             elif MAP_SAFETENSORS:
                 try:
@@ -259,6 +321,9 @@ def calculate_parameters(sd: dict[str, torch.Tensor], prefix: str = "") -> int:
 def weight_dtype(sd: dict[str, torch.Tensor], prefix: str = "") -> torch.dtype | str:
     if any(hasattr(v, "gguf_cls") for v in sd.values()):
         return "gguf"
+    for v in sd.values():
+        if (quant_type := getattr(v, "quant_type", None)) is not None:
+            return quant_type  # read_4bit_safetensors already packed it, the quant state keys are gone
     for k in sd:
         if "bitsandbytes__nf4" in k:
             return "nf4"

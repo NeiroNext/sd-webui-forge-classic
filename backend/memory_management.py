@@ -1477,6 +1477,7 @@ def sync_stream(device: torch.device, stream):
 
 
 PINNED_MEMORY = {}
+PINNED_ARENAS = {}  # arena data_ptr -> how many of its slices asked to be pinned
 PINNING_ALLOWED_TYPES = ("Parameter", "ParameterNF4")
 
 TOTAL_PINNED_MEMORY = 0
@@ -1512,6 +1513,27 @@ def pin_memory(tensor):
     if not is_device_cpu(tensor.device):
         return False
 
+    if (arena := getattr(tensor, "arena", None)) is not None:
+        # slices share their boundary pages, and registering a range twice makes the next CUDA call fail:
+        # register the whole arena for the first slice that asks, and count the rest as users of it
+        ptr = arena.data_ptr()
+        if ptr in PINNED_ARENAS:
+            PINNED_ARENAS[ptr] += 1
+            return True
+
+        size = arena.numel()
+        if (TOTAL_PINNED_MEMORY + size) > MAX_PINNED_MEMORY:
+            return False
+
+        if torch.cuda.cudart().cudaHostRegister(ptr, size, 1) != 0:
+            discard_cuda_async_error()
+            return False
+
+        PINNED_MEMORY[ptr] = size
+        PINNED_ARENAS[ptr] = 1
+        TOTAL_PINNED_MEMORY += size
+        return True
+
     if tensor.is_pinned():
         return False
 
@@ -1543,6 +1565,16 @@ def unpin_memory(tensor):
 
     if not is_device_cpu(tensor.device):
         return False
+
+    if (arena := getattr(tensor, "arena", None)) is not None:
+        ptr = arena.data_ptr()
+        if ptr not in PINNED_ARENAS:
+            return False
+        PINNED_ARENAS[ptr] -= 1
+        if PINNED_ARENAS[ptr] > 0:
+            return True  # other slices still want it pinned
+        del PINNED_ARENAS[ptr]
+        tensor = arena
 
     ptr = tensor.data_ptr()
     size = tensor.numel() * tensor.element_size()

@@ -15,6 +15,14 @@ import torch
 QUANT_STATE_KEYS = ("quant_state.bitsandbytes__nf4", "quant_state.bitsandbytes__fp4")
 
 
+def packed_size(packed_bytes: int, absmax_bytes: int, nested_absmax_bytes: int = 0) -> int:
+    """Bytes `load_nf4_parameter` needs for one weight; each float32 section starts at a multiple of 4"""
+    size = -packed_bytes % 4 + packed_bytes + absmax_bytes
+    if nested_absmax_bytes:
+        size += -size % 4 + nested_absmax_bytes
+    return size
+
+
 class ParameterNF4(torch.nn.Parameter):
     """
     One uint8 buffer holding the packed weights followed by the absmax bytes,
@@ -32,6 +40,8 @@ class ParameterNF4(torch.nn.Parameter):
         self.packed_bytes: int = packed_bytes
         self.nested: dict | None = nested  # {"code": float32 [256], "blocksize": int, "offset": float, "absmax_bytes": int}
         self.computation_dtype = torch.float16
+        self.quant_type = "nf4"
+        self.arena: torch.Tensor | None = None  # the buffer this weight is a slice of, see memory_management.pin_memory
 
     def __new__(cls, torch_tensor, *, real_shape=None, blocksize=64, code=None, packed_bytes=0, nested=None, no_init=False):
         return super().__new__(cls, torch_tensor, requires_grad=False)
@@ -48,6 +58,8 @@ class ParameterNF4(torch.nn.Parameter):
         new.packed_bytes = self.packed_bytes
         new.nested = None if self.nested is None else {**self.nested, "code": self.nested["code"].to(data.device)}
         new.computation_dtype = self.computation_dtype
+        new.quant_type = self.quant_type
+        new.arena = None  # a copy owns its data; only the original is a slice
         return new
 
     def to(self, *args, **kwargs):
@@ -59,7 +71,7 @@ class ParameterNF4(torch.nn.Parameter):
         return self.copy_with_data(torch.Tensor.pin_memory(self, device=device))
 
 
-def load_nf4_parameter(state_dict: dict, key: str, device: torch.device, computation_dtype: torch.dtype, consume: bool = False) -> ParameterNF4 | None:
+def load_nf4_parameter(state_dict: dict, key: str, device: torch.device, computation_dtype: torch.dtype, consume: bool = False, out: torch.Tensor = None) -> ParameterNF4 | None:
     """
     Build a ParameterNF4 from the `<key>` and `<key>.*` entries of a bitsandbytes checkpoint; None if `<key>` is not 4-bit.
     With `consume` the entries are dropped from `state_dict` as they are read, so each layer is freed as soon as it is packed.
@@ -76,12 +88,17 @@ def load_nf4_parameter(state_dict: dict, key: str, device: torch.device, computa
     nested = None
 
     def aligned(*parts):  # float32 sections must start at a multiple of 4 bytes to be viewed back
-        out = []
+        parts = [part.reshape(-1).view(torch.uint8) for part in parts]
+        placed, pos = [], 0
         for part in parts:
-            if out and (pad := -sum(x.numel() for x in out) % 4):
-                out.append(torch.zeros(pad, dtype=torch.uint8, device=part.device))
-            out.append(part.reshape(-1).view(torch.uint8))
-        return torch.cat(out)
+            pos += -pos % 4
+            placed.append((pos, part))
+            pos += part.numel()
+
+        buffer = torch.empty(pos, dtype=torch.uint8, device=parts[0].device) if out is None else out
+        for at, part in placed:
+            buffer[at : at + part.numel()] = part
+        return buffer
 
     if "nested_absmax" in meta or f"{key}.nested_absmax" in state_dict:
         # double quantization: absmax itself is stored as uint8 codes, scaled blockwise by nested_absmax
@@ -104,6 +121,7 @@ def load_nf4_parameter(state_dict: dict, key: str, device: torch.device, computa
         nested=nested,
     )
     param.computation_dtype = computation_dtype
+    param.quant_type = qs_key.rsplit("bitsandbytes__", 1)[1]  # once packed, the quant state keys are gone
     return param
 
 
