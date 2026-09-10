@@ -59,7 +59,7 @@ class ParameterNF4(torch.nn.Parameter):
         new.nested = None if self.nested is None else {**self.nested, "code": self.nested["code"].to(data.device)}
         new.computation_dtype = self.computation_dtype
         new.quant_type = self.quant_type
-        new.arena = None  # a copy owns its data; only the original is a slice
+        new.arena = self.arena if data.data_ptr() == self.data.data_ptr() else None  # `.to(cpu)` hands back the same slice
         return new
 
     def to(self, *args, **kwargs):

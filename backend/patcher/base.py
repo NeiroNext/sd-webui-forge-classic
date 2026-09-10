@@ -476,6 +476,8 @@ class ModelPatcher:
             return set_func(out_weight, inplace_update=inplace_update, seed=string_to_seed(key), return_weight=return_weight)
 
     def pin_weight_to_device(self, key):
+        if key in self.pinned:  # an offloaded weight is offered again on every partial load
+            return
         weight, _, _ = get_key_weight(self.model, key)
         if memory_management.pin_memory(weight):
             self.pinned.add(key)
