@@ -127,11 +127,11 @@ def map_safetensors(ckpt: str, device: torch.device) -> tuple[dict[str, torch.Te
 
 def read_4bit_safetensors(ckpt: str, device: torch.device) -> tuple[dict[str, torch.Tensor], dict | None]:
     """
-    Read one bitsandbytes weight at a time, straight into a single arena buffer. Reading the whole file
+    Read one bitsandbytes weight at a time, straight into a shared arena buffer. Reading the whole file
     and packing afterwards keeps every raw tensor alive next to its packed copy; packing into a block per
-    weight then costs another 60%, which is what the Windows allocator charges for ~20 MB blocks (0.3% for one big one)
+    weight then costs another 60%, which is what the Windows allocator charges for ~20 MB blocks
     """
-    from backend.operations_nf4 import QUANT_STATE_KEYS, load_nf4_parameter, packed_size
+    from backend.operations_nf4 import ARENA_BYTES, QUANT_STATE_KEYS, load_nf4_parameter, packed_size
 
     with open(ckpt, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
@@ -161,19 +161,29 @@ def read_4bit_safetensors(ckpt: str, device: torch.device) -> tuple[dict[str, to
             if base:
                 group_of.setdefault(base, []).append(k)
 
-        plan, total = {}, 0
-        for base in quantized:
-            total += -total % 4
+        order = sorted(quantized, key=lambda b: header[b]["data_offsets"][0])
+        plan, sizes, at = {}, [0], 0
+        for base in order:
+            at += -at % 4
             nested = span(f"{base}.nested_absmax") if f"{base}.nested_absmax" in header else 0
-            plan[base] = (total, packed_size(span(base), span(f"{base}.absmax"), nested))
-            total += plan[base][1]
+            size = packed_size(span(base), span(f"{base}.absmax"), nested)
+            if at and at + size > ARENA_BYTES:
+                sizes[-1] = at
+                sizes.append(0)
+                at = 0
+            plan[base] = (len(sizes) - 1, at, size)
+            at += size
+        sizes[-1] = at
 
-        arena = torch.empty(total, dtype=torch.uint8) if device.type == "cpu" else None
+        arenas = [None] * len(sizes)
 
         sd = {}
-        for base in sorted(quantized, key=lambda b: header[b]["data_offsets"][0]):
+        for base in order:
             group = {k: read(k) for k in sorted(group_of[base], key=lambda k: header[k]["data_offsets"][0])}
-            at, size = plan[base]
+            which, at, size = plan[base]
+            if arenas[which] is None and device.type == "cpu":
+                arenas[which] = torch.empty(sizes[which], dtype=torch.uint8)
+            arena = arenas[which]
             param = load_nf4_parameter(group, base, device, torch.float16, consume=True, out=None if arena is None else arena[at : at + size])
             param.arena = arena
             sd[base] = param

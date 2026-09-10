@@ -15,6 +15,12 @@ import torch
 QUANT_STATE_KEYS = ("quant_state.bitsandbytes__nf4", "quant_state.bitsandbytes__fp4")
 
 
+# Weights are packed into shared buffers instead of one block each: the Windows allocator charges +60% for
+# ~20 MB blocks and +3% for these. Several of them rather than one so that memory can come back when a
+# module moves to VRAM and drops its slices - a single arena is only freed once the whole model has left.
+ARENA_BYTES = 512 * 1024 * 1024
+
+
 def packed_size(packed_bytes: int, absmax_bytes: int, nested_absmax_bytes: int = 0) -> int:
     """Bytes `load_nf4_parameter` needs for one weight; each float32 section starts at a multiple of 4"""
     size = -packed_bytes % 4 + packed_bytes + absmax_bytes
