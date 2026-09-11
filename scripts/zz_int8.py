@@ -227,9 +227,8 @@ def forward(self, x):  # ForgeOperationsGGUF.Linear
 
 
 def forward_plain(self, x):  # ForgeOperations.Linear
-    if not self.parameters_manual_cast:
-        weight, bias = ops.get_weight_and_bias(self)
-        return torch.nn.functional.linear(x, weight, bias)
+    if not self.parameters_manual_cast:  # weights resident on the GPU (a model that fits, e.g. Wan 1.3B)
+        return _forward(self, x, lambda: (*ops.get_weight_and_bias(self), None))
     return _forward(self, x, lambda: weights_manual_cast(self, x))
 
 
