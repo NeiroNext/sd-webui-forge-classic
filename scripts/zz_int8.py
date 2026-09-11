@@ -12,8 +12,10 @@ from backend.operations_gguf import dequantize_tensor
 from modules import script_callbacks
 
 MODE = os.environ.get("ZZ_INT8", "")
+if MODE == "0":
+    MODE = ""
 Linear = ops.ForgeOperationsGGUF.Linear
-_orig_forward = Linear.forward
+PlainLinear = ops.ForgeOperations.Linear  # fp16 / fp8-storage checkpoints
 
 STATS = {"int8": 0, "fp16": 0, "failed": 0, "step": 0}
 ERR = defaultdict(list)  # (N, K) -> relative errors seen in check mode
@@ -101,7 +103,7 @@ def int8_linear_cached(self, x):
 def eligible(x: torch.Tensor, weight: torch.Tensor, layer=None) -> bool:
     m = x.numel() // x.shape[-1]
     n, k = weight.shape
-    if layer is not None and len(layer.weight_function) > 0:  # online LoRA patches the fp16 weight, keep the stock path
+    if layer is not None and (len(layer.weight_function) > 0 or not getattr(layer, "_int8_ok", False)):  # LoRA or not the DiT
         return False
     return x.device.type == "cuda" and weight.ndim == 2 and m > 16 and k % 8 == 0 and n % 8 == 0 and k not in EXCLUDE_K
 
@@ -147,8 +149,63 @@ def forward(self, x):
             return torch.nn.functional.linear(x, weight, bias)
 
 
+def forward_plain(self, x):
+    if not self.parameters_manual_cast:
+        weight, bias = ops.get_weight_and_bias(self)
+        return torch.nn.functional.linear(x, weight, bias)
+
+    if MODE == "1" and CACHE and getattr(self, "_w8", None) is not None and len(self.weight_function) == 0 and x.numel() // x.shape[-1] > 16:
+        STATS["int8"] += 1
+        return int8_linear_cached(self, x)
+
+    weight, bias, signal = weights_manual_cast(self, x)
+    with main_stream_worker(weight, bias, signal):
+        if not eligible(x, weight, self):
+            STATS["fp16"] += 1
+            with _Phase("fp16 linear (ineligible)"):
+                return torch.nn.functional.linear(x, weight, bias)
+
+        if MODE == "check":
+            ref = torch.nn.functional.linear(x, weight, bias)
+            if STATS["step"] <= 1:
+                out = int8_linear(x, weight, bias)
+                err = ((out.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-8)).item()
+                ERR[tuple(weight.shape)].append(err)
+            STATS["fp16"] += 1
+            return ref
+
+        try:
+            out = int8_linear(x, weight, bias)
+            STATS["int8"] += 1
+            if CACHE:
+                w8, s_w = quantize_weight(weight)
+                self._w8 = w8.to("cpu", non_blocking=False).pin_memory()
+                self._s_w = s_w
+            return out
+        except RuntimeError as e:
+            STATS["failed"] += 1
+            if STATS["failed"] == 1:
+                print(f"[INT8] _int_mm failed for weight {tuple(weight.shape)}: {str(e).splitlines()[0]}", flush=True)
+            return torch.nn.functional.linear(x, weight, bias)
+
+
+def _on_model_loaded(sd_model):
+    n = 0
+    try:
+        dit = sd_model.forge_objects.unet.model.diffusion_model
+    except AttributeError:
+        return
+    for m in dit.modules():
+        if isinstance(m, (Linear, PlainLinear)):
+            m._int8_ok = True
+            n += 1
+    print(f"[INT8] marked {n} Linear layers of {type(dit).__name__}", flush=True)
+
+
 if MODE:
     Linear.forward = forward
+    PlainLinear.forward = forward_plain
+    script_callbacks.on_model_loaded(_on_model_loaded)
     print(f"[INT8] mode={MODE} cache={CACHE} exclude_k={sorted(EXCLUDE_K)}", flush=True)
 
 
