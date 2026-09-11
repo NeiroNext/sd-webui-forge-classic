@@ -3,6 +3,8 @@ import math
 import mmap
 import os.path
 import struct
+import warnings
+import weakref
 
 import safetensors
 import torch
@@ -10,7 +12,7 @@ from einops import rearrange, repeat
 
 from backend.args import args
 from backend.loader_gguf import dequantize, get_orig_shape
-from backend.memory_management import logger
+from backend.memory_management import READONLY_MAPS, is_readonly_mapped, logger
 from backend.operations_gguf import ParameterGGUF
 from modules_forge.packages import gguf
 from modules_forge.packages.comfy.weight_adapter.base import WeightAdapterBase
@@ -103,24 +105,33 @@ def read_safetensors(ckpt: str, device: torch.device) -> tuple[dict[str, torch.T
 
 def map_safetensors(ckpt: str, device: torch.device) -> tuple[dict[str, torch.Tensor], dict | None]:
     """
-    Tensors as views into one copy-on-write mapping of the file. `safe_open` maps it the same way, but
-    while it does, Windows is charged twice the file size in commit; a plain read costs the read instead
+    Tensors as views into one read-only mapping of the file. `safe_open` maps it copy-on-write, and Windows
+    charges such a view the full file size in commit the moment it is mapped; a read-only view is file-backed
+    and charges nothing, but writing to a weight in place would kill the process (see `copy_to_param`)
     """
     with open(ckpt, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
         header: dict = json.loads(f.read(n))
         metadata = header.pop("__metadata__", None)
-        view = memoryview(mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_COPY))
+        mapping = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        view = memoryview(mapping)
 
-    sd = {}
-    for k, h in header.items():
-        start, end = h["data_offsets"]
-        dtype = SAFETENSORS_DTYPES[h["dtype"]]
-        if end > start:
-            tensor = torch.frombuffer(view, dtype=torch.uint8, count=end - start, offset=8 + n + start).view(dtype).reshape(h["shape"])
-        else:
-            tensor = torch.empty(h["shape"], dtype=dtype)
-        sd[k] = tensor if device.type == "cpu" else tensor.to(device)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # torch warns on every non-writable buffer; nothing writes to these
+
+        sd = {}
+        for k, h in header.items():
+            start, end = h["data_offsets"]
+            dtype = SAFETENSORS_DTYPES[h["dtype"]]
+            if end > start:
+                tensor = torch.frombuffer(view, dtype=torch.uint8, count=end - start, offset=8 + n + start).view(dtype).reshape(h["shape"])
+            else:
+                tensor = torch.empty(h["shape"], dtype=dtype)
+            sd[k] = tensor if device.type == "cpu" else tensor.to(device)
+
+        base = torch.frombuffer(view, dtype=torch.uint8).data_ptr()
+
+    READONLY_MAPS.append((weakref.ref(mapping), base, base + view.nbytes))
 
     return sd, metadata
 
@@ -300,6 +311,10 @@ def copy_to_param(obj, attr, value):
     for name in attrs[:-1]:
         obj = getattr(obj, name)
     prev = getattr(obj, attrs[-1])
+    if is_readonly_mapped(prev.data_ptr()):  # writing into a read-only mapping kills the process without an exception
+        value = value.to(prev.dtype)
+        setattr(obj, attrs[-1], torch.nn.Parameter(value, requires_grad=False) if isinstance(prev, torch.nn.Parameter) else value)
+        return
     prev.data.copy_(value)
 
 

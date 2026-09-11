@@ -1478,7 +1478,13 @@ def sync_stream(device: torch.device, stream):
 
 PINNED_MEMORY = {}
 PINNED_ARENAS = {}  # arena data_ptr -> [the arena itself, how many of its slices asked to be pinned]
+READONLY_MAPS = []  # (weak reference to the mapping, base, end) of every read-only mapping of a checkpoint
 PINNING_ALLOWED_TYPES = ("Parameter", "ParameterNF4")
+
+
+def is_readonly_mapped(ptr: int) -> bool:
+    READONLY_MAPS[:] = [m for m in READONLY_MAPS if m[0]() is not None]  # an unloaded model releases its mapping
+    return any(base <= ptr < end for _, base, end in READONLY_MAPS)
 
 TOTAL_PINNED_MEMORY = 0
 MAX_PINNED_MEMORY = -1
@@ -1548,7 +1554,9 @@ def pin_memory(tensor):
     if ptr == 0:
         return False
 
-    if torch.cuda.cudart().cudaHostRegister(ptr, size, 1) == 0:
+    flags = 8 if is_readonly_mapped(ptr) else 1  # cudaHostRegisterReadOnly: a read-only mapping is rejected without it
+
+    if torch.cuda.cudart().cudaHostRegister(ptr, size, flags) == 0:
         PINNED_MEMORY[ptr] = size
         TOTAL_PINNED_MEMORY += size
         return True
