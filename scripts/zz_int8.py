@@ -15,6 +15,8 @@ MODE = os.environ.get("ZZ_INT8", "")
 if MODE == "0":
     MODE = ""
 from backend.operations_nf4 import dequantize_nf4
+from backend.patcher.base import LowVramPatch, OnlineLoRAPatch
+from modules_forge.packages.comfy.weight_adapter.lora import LoRAAdapter
 
 Linear = ops.ForgeOperationsGGUF.Linear
 PlainLinear = ops.ForgeOperations.Linear  # fp16 / fp8-storage checkpoints
@@ -83,7 +85,48 @@ def quantize_weight(weight):
     return w8, s_w
 
 
-def int8_linear_cached(self, x):
+def _lora_entries(layer):
+    """(strength, adapter) for every LoRA on the layer, [] if none, None if something is not a plain up/down LoRA"""
+    entries = []
+    if len(getattr(layer, "bias_function", ())) > 0:
+        return None
+    for fn in layer.weight_function:
+        if isinstance(fn, LowVramPatch):
+            ps = fn.patches.get(fn.key, [])
+        elif isinstance(fn, OnlineLoRAPatch):
+            ps = fn.patch
+        else:
+            return None
+        for strength, v, strength_model, offset, function in ps:
+            if not isinstance(v, LoRAAdapter) or offset is not None or function is not None or strength_model != 1.0:
+                return None
+            if v.weights[3] is not None or v.weights[4] is not None or v.weights[5] is not None:  # mid / dora / reshape
+                return None
+            entries.append((strength, v))
+    return entries
+
+
+def _lora_branch(self, x2, entries):
+    """sum of strength * alpha/r * (x @ down^T) @ up^T, the same delta merge_lora_to_weight adds to the weight"""
+    sig = tuple((id(v), id(v.weights[0]), float(st)) for st, v in entries)
+    if getattr(self, "_lora_sig", None) != sig:
+        mats = []
+        for strength, v in entries:
+            up, down, alpha = v.weights[0], v.weights[1], v.weights[2]
+            scale = strength * (alpha / down.shape[0] if alpha is not None else 1.0)
+            down_t = down.flatten(start_dim=1).to(device=x2.device, dtype=x2.dtype).t().contiguous()  # [K, r]
+            up_t = (up.flatten(start_dim=1).to(device=x2.device, dtype=torch.float32) * scale).to(x2.dtype).t().contiguous()  # [r, N]
+            mats.append((down_t, up_t))
+        self._lora_mats, self._lora_sig = mats, sig
+        STATS["lora_built"] = STATS.get("lora_built", 0) + 1
+    out = None
+    for down_t, up_t in self._lora_mats:
+        t = (x2 @ down_t) @ up_t
+        out = t if out is None else out + t
+    return out
+
+
+def int8_linear_cached(self, x, lora=()):
     shape = x.shape
     x2 = x.reshape(-1, shape[-1])
     with _Phase("weight upload"):
@@ -100,19 +143,23 @@ def int8_linear_cached(self, x):
         acc = torch._int_mm(x8, w8)
     with _Phase("rescale"):
         out = rescale(acc, s_x, s_w, bias, x.dtype)
+    if lora:
+        with _Phase("lora branch"):
+            out += _lora_branch(self, x2, lora)
+            STATS["lora"] = STATS.get("lora", 0) + 1
     return out.reshape(*shape[:-1], w8.shape[1])
 
 
 def eligible(x: torch.Tensor, weight: torch.Tensor, layer=None) -> bool:
     m = x.numel() // x.shape[-1]
     n, k = weight.shape
-    if layer is not None and (len(layer.weight_function) > 0 or not getattr(layer, "_int8_ok", False)):  # LoRA or not the DiT
+    if layer is not None and not getattr(layer, "_int8_ok", False):  # not the DiT
         return False
     return x.device.type == "cuda" and weight.ndim == 2 and m > 16 and k % 8 == 0 and n % 8 == 0 and k not in EXCLUDE_K
 
 
-def _body(self, x, weight, bias):
-    if not eligible(x, weight, self):
+def _body(self, x, weight, bias, lora=()):
+    if not eligible(x, weight, self) or (MODE == "check" and lora):
         STATS["fp16"] += 1
         with _Phase("fp16 linear (ineligible)"):
             return torch.nn.functional.linear(x, weight, bias)
@@ -133,6 +180,10 @@ def _body(self, x, weight, bias):
             w8, s_w = quantize_weight(weight)
             self._w8 = w8.to("cpu", non_blocking=False).pin_memory()
             self._s_w = s_w
+        if lora:
+            x2 = x.reshape(-1, x.shape[-1])
+            out = out + _lora_branch(self, x2, lora).reshape(out.shape)
+            STATS["lora"] = STATS.get("lora", 0) + 1
         return out
     except RuntimeError as e:
         STATS["failed"] += 1
@@ -142,7 +193,29 @@ def _body(self, x, weight, bias):
 
 
 def _cached_ok(self, x):
-    return MODE == "1" and CACHE and getattr(self, "_w8", None) is not None and len(self.weight_function) == 0 and x.numel() // x.shape[-1] > 16
+    return MODE == "1" and CACHE and getattr(self, "_w8", None) is not None and x.numel() // x.shape[-1] > 16
+
+
+def _forward(self, x, cast):
+    lora = _lora_entries(self) if (self.weight_function or self.bias_function) else []
+    if lora is None or (lora and MODE != "1"):  # a LoRA we cannot express as a side branch: stock path, merged weight
+        weight, bias, signal = cast()
+        with main_stream_worker(weight, bias, signal):
+            STATS["fp16"] += 1
+            return torch.nn.functional.linear(x, weight, bias)
+    if _cached_ok(self, x):
+        STATS["int8"] += 1
+        return int8_linear_cached(self, x, lora)
+    if lora:  # first call: quantise the BASE weight, keep the LoRA out of the merge, it becomes the side branch
+        saved, self.weight_function = self.weight_function, []
+        try:
+            weight, bias, signal = cast()
+        finally:
+            self.weight_function = saved
+    else:
+        weight, bias, signal = cast()
+    with main_stream_worker(weight, bias, signal):
+        return _body(self, x, weight, bias, lora)
 
 
 def forward(self, x):  # ForgeOperationsGGUF.Linear
@@ -150,33 +223,18 @@ def forward(self, x):  # ForgeOperationsGGUF.Linear
         self.bias = ops.utils.tensor2parameter(dequantize_tensor(self.bias).to(x.dtype))
     if self.weight is not None and self.weight.dtype != x.dtype and getattr(self.weight, "gguf_cls", None) is None:
         self.weight = ops.utils.tensor2parameter(self.weight.to(x.dtype))
-    if _cached_ok(self, x):
-        STATS["int8"] += 1
-        return int8_linear_cached(self, x)
-    weight, bias, signal = weights_manual_cast(self, x, weight_fn=dequantize_tensor, skip_bias_dtype=True)
-    with main_stream_worker(weight, bias, signal):
-        return _body(self, x, weight, bias)
+    return _forward(self, x, lambda: weights_manual_cast(self, x, weight_fn=dequantize_tensor, skip_bias_dtype=True))
 
 
 def forward_plain(self, x):  # ForgeOperations.Linear
     if not self.parameters_manual_cast:
         weight, bias = ops.get_weight_and_bias(self)
         return torch.nn.functional.linear(x, weight, bias)
-    if _cached_ok(self, x):
-        STATS["int8"] += 1
-        return int8_linear_cached(self, x)
-    weight, bias, signal = weights_manual_cast(self, x)
-    with main_stream_worker(weight, bias, signal):
-        return _body(self, x, weight, bias)
+    return _forward(self, x, lambda: weights_manual_cast(self, x))
 
 
 def forward_nf4(self, x):  # ForgeOperationsNF4.Linear
-    if _cached_ok(self, x):
-        STATS["int8"] += 1
-        return int8_linear_cached(self, x)
-    weight, bias, signal = weights_manual_cast(self, x, weight_fn=dequantize_nf4)
-    with main_stream_worker(weight, bias, signal):
-        return _body(self, x, weight, bias)
+    return _forward(self, x, lambda: weights_manual_cast(self, x, weight_fn=dequantize_nf4))
 
 
 def _on_model_loaded(sd_model):
@@ -238,8 +296,8 @@ if MODE:
 
 def _on_denoiser(params):  # fires BEFORE the model call of each step, so the counts belong to the previous call
     s = STATS["step"]  # state.sampling_step lags one call behind, count ourselves
-    if 1 <= s <= 2:
-        print(f"[INT8] call {s - 1}: int8 {STATS['int8']} fp16 {STATS['fp16']} failed {STATS['failed']} invalidated {STATS.get('invalidated', 0)}", flush=True)
+    if 1 <= s <= 2 or STATS.get("lora_built", 0):
+        print(f"[INT8] call {s - 1}: int8 {STATS['int8']} fp16 {STATS['fp16']} failed {STATS['failed']} lora {STATS.get('lora', 0)} lora_built {STATS.get('lora_built', 0)} invalidated {STATS.get('invalidated', 0)}", flush=True)
         if PROF:
             for name, ms in sorted(TIMES.items(), key=lambda kv: -kv[1]):
                 print(f"[INT8]   {name:26s} {ms:8.1f} ms", flush=True)
@@ -248,7 +306,7 @@ def _on_denoiser(params):  # fires BEFORE the model call of each step, so the co
             for shape, errs in sorted(ERR.items(), key=lambda kv: -max(kv[1])):
                 print(f"[INT8]   weight {shape}: n={len(errs)} rel.err mean {sum(errs)/len(errs):.2e} max {max(errs):.2e}", flush=True)
     STATS["step"] = s + 1
-    STATS["int8"] = STATS["fp16"] = STATS["failed"] = 0
+    STATS["int8"] = STATS["fp16"] = STATS["failed"] = STATS["lora"] = STATS["lora_built"] = 0
 
 
 script_callbacks.on_cfg_denoiser(_on_denoiser)
