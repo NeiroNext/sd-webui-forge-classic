@@ -22,7 +22,11 @@ setup_logger(logger)
 # (measured on a GTX 1070: Flux 1.9x, Chroma 2.8x, Z-Image 2.7x; SDXL and Wan 1.3B gain nothing)
 INT8_MODELS = ("IntegratedFluxTransformer2DModel", "IntegratedChromaTransformer2DModel", "NextDiT")
 MIN_ROWS = 17  # torch._int_mm needs M > 16: a modulation GEMV is padded up to it, that is cheaper than a dequantise
-CACHE_VERSION = "1"  # bump when the blob layout or the quantisation changes
+# ConvRot: real DiT activations carry channels hundreds of times above the row mean, and a per-token absmax
+# then has to cover that one value for the whole row. Rotating blocks of 64 channels spreads them and costs
+# ~3% of the GEMM time; measured on Flux 768x1024, the image goes from 29.45 dB to 41.40 dB against stock.
+ROT_GROUP = int(os.environ.get("INT8_CONVROT", "64"))  # Hadamard block size, 0 = off; must be a power of 4
+CACHE_VERSION = f"1r{ROT_GROUP}"  # bump when the blob layout or the quantisation changes
 BLOCK_BYTES = 128 * 1024**2  # budget for one row block's int32 + fp32 temporaries; the whole output would be 8x
 
 
@@ -68,7 +72,38 @@ class ParameterInt8(torch.nn.Parameter):
         return self.data[k * n :].view(torch.float32)
 
     def dequantize(self, dtype=None) -> torch.Tensor:
-        return (self.w8().t().to(torch.float32) * self.scale()[:, None]).to(dtype or self.computation_dtype)
+        w = self.w8().t().to(torch.float32) * self.scale()[:, None]
+        if g := rot_group(self.real_shape[1]):
+            w = rotate(w, g)  # back to the original basis
+        return w.to(dtype or self.computation_dtype)
+
+
+_HADAMARD: dict[tuple, torch.Tensor] = {}
+
+
+def hadamard(size: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """A normalised Hadamard matrix of a power-of-4 size; symmetric and orthogonal, so it is its own inverse."""
+    key = (size, dtype, str(device))
+    if key not in _HADAMARD:
+        h = h4 = torch.tensor([[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]], dtype=torch.float32)
+        while h.shape[0] < size:
+            h = torch.kron(h, h4)
+        _HADAMARD[key] = (h / size**0.5).to(dtype=dtype, device=device)
+    return _HADAMARD[key]
+
+
+def rotate(t: torch.Tensor, group: int) -> torch.Tensor:
+    """
+    Mix every block of `group` input channels with a Hadamard matrix. Applied to the weight at quantisation and
+    to the activation at every call it cancels out - H is an involution - but it spreads the outlier channels a
+    DiT carries, so the per-token absmax no longer has to cover one huge value for the whole row.
+    """
+    h = hadamard(group, t.dtype, t.device)
+    return torch.matmul(t.reshape(-1, t.shape[-1] // group, group), h).reshape(t.shape)
+
+
+def rot_group(k: int) -> int:
+    return ROT_GROUP if ROT_GROUP and k % ROT_GROUP == 0 else 0
 
 
 def blob_size(n: int, k: int) -> int:
@@ -77,6 +112,8 @@ def blob_size(n: int, k: int) -> int:
 
 def quantize(weight: torch.Tensor, computation_dtype=torch.float16, out: torch.Tensor = None) -> ParameterInt8:
     w = weight.detach().to(torch.float32)
+    if g := rot_group(w.shape[1]):
+        w = rotate(w, g)
     s = w.abs().amax(dim=1).clamp_min_(1e-8) / 127.0
     q = torch.round(w * (1.0 / s)[:, None]).clamp_(-127, 127).to(torch.int8).t().contiguous()
     blob = torch.cat([q.view(-1).view(torch.uint8), s.view(torch.uint8)])
@@ -302,7 +339,8 @@ def int8_linear(x: torch.Tensor, weight: ParameterInt8, bias: torch.Tensor, laye
     x2 = x.reshape(-1, shape[-1])
     rows, n = x2.shape[0], weight.real_shape[0]
     w8, s_w = weight.w8(), weight.scale()
-    low = lora_lowrank(layer, x2, lora) if lora else ()
+    g = rot_group(shape[-1])
+    low = lora_lowrank(layer, x2, lora) if lora else ()  # the side branch stays in the original basis
 
     out = torch.empty(rows, n, dtype=x.dtype, device=x.device)
     block = max(MIN_ROWS, BLOCK_BYTES // (8 * n))
@@ -312,6 +350,8 @@ def int8_linear(x: torch.Tensor, weight: ParameterInt8, bias: torch.Tensor, laye
         if j - i < MIN_ROWS:  # torch._int_mm needs M > 16
             xb = torch.nn.functional.pad(xb, (0, 0, 0, MIN_ROWS - (j - i)))
 
+        if g:
+            xb = rotate(xb, g)
         s_x = xb.abs().amax(dim=1).float().clamp_min_(1e-8) / 127.0
         x8 = torch.round(xb.float() * (1.0 / s_x)[:, None]).clamp_(-127, 127).to(torch.int8)
         ob = torch._int_mm(x8, w8)[: j - i] * s_x[: j - i, None]  # the int32 sum is exact, the scaling must stay fp32
