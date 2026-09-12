@@ -4,7 +4,10 @@ Pascal (4.5x the fp32 rate on a GTX 1070). Weights are quantised once at load, p
 per token at every call; a LoRA is added as a low-rank side branch instead of being merged into the weight.
 """
 
+import json
 import logging
+import os
+import struct
 from functools import partial
 
 import torch
@@ -19,6 +22,7 @@ setup_logger(logger)
 # (measured on a GTX 1070: Flux 1.9x, Chroma 2.8x, Z-Image 2.7x; SDXL and Wan 1.3B gain nothing)
 INT8_MODELS = ("IntegratedFluxTransformer2DModel", "IntegratedChromaTransformer2DModel", "NextDiT")
 MIN_ROWS = 17  # torch._int_mm needs M > 16: a modulation GEMV is padded up to it, that is cheaper than a dequantise
+CACHE_VERSION = "1"  # bump when the blob layout or the quantisation changes
 
 
 class ParameterInt8(torch.nn.Parameter):
@@ -95,38 +99,115 @@ def dequantize_source(weight: torch.Tensor, device: torch.device) -> torch.Tenso
     return weight.to(device=device, dtype=torch.float16)
 
 
-def quantize_model(model: torch.nn.Module) -> int:
+def quantize_model(model: torch.nn.Module, source: str = None) -> int:
     name = type(model).__name__
     if name not in INT8_MODELS:
         logger.info(f"Not quantising {name}: its Linear layers are too small to gain from int8")
         return 0
 
-    from backend.operations_nf4 import ARENA_BYTES
-
-    device = memory_management.get_torch_device()
     todo, skipped = [], 0
-    for module in model.modules():
+    for module_name, module in model.named_modules():
         if type(module).__name__ != "Linear" or not hasattr(module, "weight_function") or module.weight is None:
             continue
         n, k = module.weight.shape if module.weight.ndim == 2 else (0, 0)
         if n == 0 or n % 8 or k % 8:
             skipped += 1
             continue
-        todo.append((module, blob_size(n, k)))
+        todo.append((module_name, module, (n, k)))
 
+    if source is not None and os.path.isfile(source):
+        try:
+            path = cache_path(source)
+            if not cache_is_valid(path, source, name, todo):
+                build_cache(path, source, name, todo)
+            load_cache(path, todo)
+            logger.info(f"Loaded {len(todo)} int8 Linear layers of {name} from {os.path.basename(path)} ({skipped} skipped)")
+            return len(todo)
+        except Exception as e:
+            logger.warning(f"int8 cache unavailable ({e}); quantising into RAM instead")
+
+    quantize_into_ram(todo)
+    logger.info(f"Quantised {len(todo)} Linear layers of {name} to int8 ({skipped} skipped)")
+    return len(todo)
+
+
+def install(module, weight: ParameterInt8):
+    module.weight = weight
+    module.convert_weight = convert_weight
+    module.set_weight = partial(set_weight, module)
+
+
+def quantize_into_ram(todo: list):
+    from backend.operations_nf4 import ARENA_BYTES
+
+    device = memory_management.get_torch_device()
     # the Windows allocator rounds ~50 MB blocks up by half: pack the blobs into a few big arenas instead
     arena, at = None, 0
-    for module, size in todo:
+    for _, module, (n, k) in todo:
+        size = blob_size(n, k)
         if arena is None or at + size > arena.numel():
             arena, at = torch.empty(max(size, ARENA_BYTES), dtype=torch.uint8), 0
         weight = quantize(dequantize_source(module.weight, device), getattr(module.weight, "computation_dtype", torch.float16), out=arena[at : at + size])
         weight.arena = arena
         at += size
-        module.weight = weight
-        module.convert_weight = convert_weight
-        module.set_weight = partial(set_weight, module)
-    logger.info(f"Quantised {len(todo)} Linear layers of {name} to int8 ({skipped} skipped)")
-    return len(todo)
+        install(module, weight)
+
+
+# region disk cache: a safetensors file of blobs, written once weight by weight and mapped read-only afterwards,
+# so neither building nor using it ever holds the int8 model in RAM
+
+
+def cache_path(source: str) -> str:
+    stem = os.path.splitext(os.path.basename(source))[0]
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(source))), "int8", f"{stem}.int8.safetensors")
+
+
+def cache_tags(source: str, model_name: str) -> dict[str, str]:
+    st = os.stat(source)
+    return {"int8_version": CACHE_VERSION, "model": model_name, "source": os.path.basename(source), "source_size": str(st.st_size), "source_mtime": str(int(st.st_mtime))}
+
+
+def cache_is_valid(path: str, source: str, model_name: str, todo: list) -> bool:
+    if not os.path.isfile(path):
+        return False
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(n))
+    meta = header.pop("__metadata__", {})
+    if any(meta.get(k) != v for k, v in cache_tags(source, model_name).items()):
+        return False
+    shapes = json.loads(meta.get("shapes", "{}"))
+    return all(shapes.get(name) == [n, k] and header.get(name, {}).get("shape") == [blob_size(n, k)] for name, _, (n, k) in todo)
+
+
+def build_cache(path: str, source: str, model_name: str, todo: list):
+    device = memory_management.get_torch_device()
+    header, at = {}, 0
+    for name, _, (n, k) in todo:
+        size = blob_size(n, k)
+        header[name] = {"dtype": "U8", "shape": [size], "data_offsets": [at, at + size]}
+        at += size
+    header["__metadata__"] = dict(cache_tags(source, model_name), shapes=json.dumps({name: [n, k] for name, _, (n, k) in todo}))
+    head = json.dumps(header).encode("utf-8")
+    head += b" " * (-len(head) % 8)
+
+    logger.info(f"Building the int8 cache {os.path.basename(path)} ({at / 2**30:.1f} GB)")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(struct.pack("<Q", len(head)))
+        f.write(head)
+        for _, module, _ in todo:
+            f.write(quantize(dequantize_source(module.weight, device)).data.numpy().tobytes())
+    os.replace(tmp, path)
+
+
+def load_cache(path: str, todo: list):
+    from backend.utils import map_safetensors
+
+    sd, meta = map_safetensors(path, torch.device("cpu"))
+    for name, module, (n, k) in todo:
+        install(module, ParameterInt8(sd[name], real_shape=(n, k), computation_dtype=getattr(module.weight, "computation_dtype", torch.float16)))
 
 
 # region patcher hooks: a merged LoRA dequantises, merges in fp16 and requantises

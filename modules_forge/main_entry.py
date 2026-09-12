@@ -35,6 +35,8 @@ forge_unet_storage_dtype_options: dict[str, tuple[torch.dtype, bool]] = {
     "float8-e4m3fn (fp16 LoRA)": (torch.float8_e4m3fn, True),
     "float8-e5m2": (torch.float8_e5m2, False),
     "float8-e5m2 (fp16 LoRA)": (torch.float8_e5m2, True),
+    "int8 (dp4a GEMM)": ("int8", False),
+    "int8 (dp4a GEMM, disk cache)": ("int8-cache", False),
 }
 
 

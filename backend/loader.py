@@ -438,6 +438,10 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             quant_config = detect_quantization(state_dict, is_unet=True)
 
             override_dtype = backend.args.dynamic_args.forge_unet_storage_dtype
+            int8_linear = backend.args.args.int8_linear or override_dtype in ("int8", "int8-cache")
+            int8_cache = backend.args.args.int8_cache or override_dtype == "int8-cache"
+            if override_dtype in ("int8", "int8-cache"):  # "Diffusion in Low Bits" entries, not storage dtypes
+                override_dtype = None
 
             if guess.nunchaku:
                 storage_dtype = torch.bfloat16
@@ -497,10 +501,10 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             load_state_dict(model, state_dict)
             # model = post_func(model)
 
-            if backend.args.args.int8_linear and not guess.nunchaku:
+            if int8_linear and not guess.nunchaku:
                 from backend.operations_int8 import quantize_model
 
-                quantize_model(model)
+                quantize_model(model, getattr(guess, "checkpoint_path", None) if int8_cache else None)
 
             if hasattr(model, "_internal_dict"):
                 model._internal_dict = unet_config
@@ -910,6 +914,7 @@ def forge_loader(sd: os.PathLike, additional_state_dicts: list[os.PathLike] = No
     if "xl" in repo_name and "rectified" in str(sd).lower():
         estimated_config.sampling_settings["RF"] = True
 
+    estimated_config.checkpoint_path = str(sd)
     if getattr(estimated_config, "nunchaku", False):
         estimated_config.unet_config["filename"] = str(sd)
 
