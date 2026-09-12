@@ -1479,7 +1479,7 @@ def sync_stream(device: torch.device, stream):
 PINNED_MEMORY = {}
 PINNED_ARENAS = {}  # arena data_ptr -> [the arena itself, how many of its slices asked to be pinned]
 READONLY_MAPS = []  # (weak reference to the mapping, base, end) of every read-only mapping of a checkpoint
-PINNING_ALLOWED_TYPES = ("Parameter", "ParameterNF4")
+PINNING_ALLOWED_TYPES = ("Parameter", "ParameterNF4", "ParameterInt8")
 
 
 def is_readonly_mapped(ptr: int) -> bool:
