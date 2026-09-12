@@ -438,7 +438,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
             quant_config = detect_quantization(state_dict, is_unet=True)
 
             override_dtype = backend.args.dynamic_args.forge_unet_storage_dtype
-            int8_linear = backend.args.args.int8_linear or override_dtype in ("int8", "int8-cache")
+            int8_linear = backend.args.args.int8_linear or backend.args.args.int8_cache or override_dtype in ("int8", "int8-cache")
             int8_cache = backend.args.args.int8_cache or override_dtype == "int8-cache"
             if override_dtype in ("int8", "int8-cache"):  # "Diffusion in Low Bits" entries, not storage dtypes
                 override_dtype = None

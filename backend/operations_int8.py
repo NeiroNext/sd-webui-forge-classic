@@ -99,15 +99,35 @@ def dequantize_source(weight: torch.Tensor, device: torch.device) -> torch.Tenso
     return weight.to(device=device, dtype=torch.float16)
 
 
+def int_mm_works(device: torch.device) -> bool:
+    """dp4a / IMMA: present since Pascal, but not on every device torch runs on"""
+    try:
+        a = torch.zeros(MIN_ROWS, 8, dtype=torch.int8, device=device)
+        torch._int_mm(a, a.new_zeros(8, 8))
+        return True
+    except Exception as e:
+        logger.warning(f"int8 GEMM unavailable on {device}: {e}")
+        return False
+
+
 def quantize_model(model: torch.nn.Module, source: str = None) -> int:
     name = type(model).__name__
     if name not in INT8_MODELS:
         logger.info(f"Not quantising {name}: its Linear layers are too small to gain from int8")
         return 0
 
+    device = memory_management.get_torch_device()
+    if not int_mm_works(device):
+        return 0
+
+    # only the Linear classes whose forward we hook: a mixed-precision checkpoint builds its own
+    from backend.operations import ForgeOperations, ForgeOperationsGGUF, ForgeOperationsNF4
+
+    supported = (ForgeOperations.Linear, ForgeOperationsGGUF.Linear, ForgeOperationsNF4.Linear)
+
     todo, skipped = [], 0
     for module_name, module in model.named_modules():
-        if type(module).__name__ != "Linear" or not hasattr(module, "weight_function") or module.weight is None:
+        if not isinstance(module, supported) or module.weight is None:
             continue
         n, k = module.weight.shape if module.weight.ndim == 2 else (0, 0)
         if n == 0 or n % 8 or k % 8:
@@ -141,6 +161,7 @@ def quantize_into_ram(todo: list):
     from backend.operations_nf4 import ARENA_BYTES
 
     device = memory_management.get_torch_device()
+    # a weight is dequantised on the GPU and the int8 blob kept on the CPU; the memory manager moves it back
     # the Windows allocator rounds ~50 MB blocks up by half: pack the blobs into a few big arenas instead
     arena, at = None, 0
     for _, module, (n, k) in todo:
