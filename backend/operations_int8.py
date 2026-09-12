@@ -23,6 +23,7 @@ setup_logger(logger)
 INT8_MODELS = ("IntegratedFluxTransformer2DModel", "IntegratedChromaTransformer2DModel", "NextDiT")
 MIN_ROWS = 17  # torch._int_mm needs M > 16: a modulation GEMV is padded up to it, that is cheaper than a dequantise
 CACHE_VERSION = "1"  # bump when the blob layout or the quantisation changes
+BLOCK_BYTES = 128 * 1024**2  # budget for one row block's int32 + fp32 temporaries; the whole output would be 8x
 
 
 class ParameterInt8(torch.nn.Parameter):
@@ -268,8 +269,8 @@ def lora_entries(layer) -> list | None:
     return entries
 
 
-def lora_branch(layer, x2: torch.Tensor, out: torch.Tensor, entries: list) -> None:
-    """out += strength * alpha/r * (x @ down^T) @ up^T for each LoRA, the same delta merge_lora_to_weight adds"""
+def lora_lowrank(layer, x2: torch.Tensor, entries: list) -> list:
+    """x @ down^T for every LoRA: [tokens, rank], small enough to keep whole; up^T is applied per block"""
     sig = tuple((id(v), float(strength)) for strength, v, _ in entries)
     cached = layer.__dict__.get("_int8_lora")
     if cached is None or cached[0] != sig:
@@ -281,36 +282,51 @@ def lora_branch(layer, x2: torch.Tensor, out: torch.Tensor, entries: list) -> No
             up_t = (up.flatten(start_dim=1).to(device=x2.device, dtype=torch.float32) * scale).to(x2.dtype).t().contiguous()
             mats.append((down_t, up_t, offset))
         layer._int8_lora = cached = (sig, mats)
+
+    low = []
     for down_t, up_t, offset in cached[1]:
-        if offset is None:
-            out += (x2 @ down_t) @ up_t
-        elif offset[0] == 0:  # a LoRA trained on one part of a fused weight (q / k / v of a qkv)
-            out[:, offset[1] : offset[1] + offset[2]] += (x2 @ down_t) @ up_t
-        else:
-            out += (x2[:, offset[1] : offset[1] + offset[2]] @ down_t) @ up_t
+        src = x2 if offset is None or offset[0] == 0 else x2[:, offset[1] : offset[1] + offset[2]]
+        low.append((src @ down_t, up_t, offset))
+    return low
 
 
 # region forward
 
 
 def int8_linear(x: torch.Tensor, weight: ParameterInt8, bias: torch.Tensor, layer, lora: list) -> torch.Tensor:
+    """
+    Row blocks: _int_mm gives int32 and the rescale needs fp32, so holding the whole output costs 8 bytes per element
+    against the 2 of the fp16 result - at hires that is over a gigabyte for one layer and the driver starts paging.
+    """
     shape = x.shape
     x2 = x.reshape(-1, shape[-1])
-    rows = x2.shape[0]
-    if rows < MIN_ROWS:
-        x2 = torch.nn.functional.pad(x2, (0, 0, 0, MIN_ROWS - rows))
-    s_x = x2.abs().amax(dim=1).float().clamp_min_(1e-8) / 127.0
-    x8 = torch.round(x2.float() * (1.0 / s_x)[:, None]).clamp_(-127, 127).to(torch.int8)
-    out = torch._int_mm(x8, weight.w8()) * s_x[:, None]  # int32 accumulate is exact, the scaling must stay fp32
-    out.mul_(weight.scale()[None, :])
-    out = out.to(x.dtype)
-    if rows < MIN_ROWS:
-        out, x2 = out[:rows], x2[:rows]
-    if bias is not None:
-        out += bias
-    if lora:
-        lora_branch(layer, x2, out, lora)
-    return out.reshape(*shape[:-1], out.shape[-1])
+    rows, n = x2.shape[0], weight.real_shape[0]
+    w8, s_w = weight.w8(), weight.scale()
+    low = lora_lowrank(layer, x2, lora) if lora else ()
+
+    out = torch.empty(rows, n, dtype=x.dtype, device=x.device)
+    block = max(MIN_ROWS, BLOCK_BYTES // (8 * n))
+    for i in range(0, rows, block):
+        j = min(i + block, rows)
+        xb = x2[i:j]
+        if j - i < MIN_ROWS:  # torch._int_mm needs M > 16
+            xb = torch.nn.functional.pad(xb, (0, 0, 0, MIN_ROWS - (j - i)))
+
+        s_x = xb.abs().amax(dim=1).float().clamp_min_(1e-8) / 127.0
+        x8 = torch.round(xb.float() * (1.0 / s_x)[:, None]).clamp_(-127, 127).to(torch.int8)
+        ob = torch._int_mm(x8, w8)[: j - i] * s_x[: j - i, None]  # the int32 sum is exact, the scaling must stay fp32
+        ob.mul_(s_w[None, :])
+        ob = ob.to(x.dtype)
+        if bias is not None:
+            ob += bias
+        for lo, up_t, offset in low:
+            if offset is None or offset[0] != 0:
+                ob.addmm_(lo[i:j], up_t)
+            else:  # a LoRA trained on one part of a fused weight (q / k / v of a qkv)
+                ob[:, offset[1] : offset[1] + offset[2]].addmm_(lo[i:j], up_t)
+        out[i:j] = ob
+
+    return out.reshape(*shape[:-1], n)
 
 
 def forward(layer, x: torch.Tensor) -> torch.Tensor:
