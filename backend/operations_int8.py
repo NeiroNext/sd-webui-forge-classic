@@ -262,9 +262,10 @@ def build_cache(path: str, source: str, model_name: str, todo: list):
 
 
 def load_cache(path: str, todo: list):
-    from backend.utils import map_safetensors
+    from backend.utils import DISABLE_MMAP, map_safetensors, read_safetensors
 
-    sd, meta = map_safetensors(path, torch.device("cpu"))
+    # the cache is mapped read-only, which is what keeps it out of the commit; --disable-mmap asks for no mapping at all
+    sd, meta = (read_safetensors if DISABLE_MMAP else map_safetensors)(path, torch.device("cpu"))
     for name, module, (n, k) in todo:
         install(module, ParameterInt8(sd[name], real_shape=(n, k), computation_dtype=getattr(module.weight, "computation_dtype", torch.float16)))
 
