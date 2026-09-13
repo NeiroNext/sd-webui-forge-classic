@@ -167,7 +167,8 @@ def quantize_model(model: torch.nn.Module, source: str = None) -> int:
     for module_name, module in model.named_modules():
         if not isinstance(module, supported) or module.weight is None:
             continue
-        n, k = module.weight.shape if module.weight.ndim == 2 else (0, 0)
+        shape = module.weight.shape  # the reported shape: a quantised weight's own storage can be 1-D (the NF4 arena slice)
+        n, k = shape if len(shape) == 2 else (0, 0)
         if n == 0 or n % 8 or k % 8:
             skipped += 1
             continue
