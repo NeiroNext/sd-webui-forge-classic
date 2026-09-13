@@ -12,7 +12,7 @@ from functools import partial
 
 import torch
 
-from backend import memory_management
+from backend import int8_kernels, memory_management
 from backend.logging import setup_logger
 
 logger = logging.getLogger("int8")
@@ -354,13 +354,8 @@ def int8_linear(x: torch.Tensor, weight: ParameterInt8, bias: torch.Tensor, laye
 
         if g:
             xb = rotate(xb, g)
-        s_x = torch.linalg.vector_norm(xb, torch.inf, dim=1, dtype=torch.float32).clamp_min_(1e-8) / 127.0
-        x8 = torch.round(xb.float() * (1.0 / s_x)[:, None]).clamp_(-127, 127).to(torch.int8)
-        ob = torch._int_mm(x8, w8)[: j - i] * s_x[: j - i, None]  # the int32 sum is exact, the scaling must stay fp32
-        ob.mul_(s_w[None, :])
-        ob = ob.to(x.dtype)
-        if bias is not None:
-            ob += bias
+        x8, s_x = int8_kernels.quantize_rows(xb)
+        ob = int8_kernels.rescale(torch._int_mm(x8, w8)[: j - i], s_x, s_w, bias, x.dtype)
         for lo, up_t, offset in low:
             if offset is None or offset[0] != 0:
                 ob.addmm_(lo[i:j], up_t)
