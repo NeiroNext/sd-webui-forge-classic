@@ -19,7 +19,8 @@ from backend.logging import setup_logger
 logger = logging.getLogger("int8")
 setup_logger(logger)
 
-BQ, BK, DD = 32, 32, 128
+# the winning point of a 288-configuration sweep (scratchpad/attn_tune.py)
+BQ, BK, DD, KPAD, VPAD = 32, 16, 128, 2, 4
 NTH = 128
 
 SOURCE = r"""
@@ -31,17 +32,18 @@ __device__ __forceinline__ int dp4(int a, int b, int c) {
 }
 
 #define BQ 32
-#define BK 32
+#define BK 16
+#define NTH 128
 #define DD 128
 #define DW (DD/4)
-#define QSTR (DW+1)
-#define KSTR (DW+1)
-#define VSTR (DD+8)
-#define NTH 128
-#define JPT (BK/4)   /* score columns per thread */
+#define QSTR (DW+2)
+#define KSTR (DW+2)
+#define VSTR (DD+4)
+#define L (NTH/BQ)
+#define JPT (BK/L)
+#define CP2 (DD/(2*L))
 #define NEG -1e30f
 
-// q8/k8 are the int8 rows reinterpreted as int32 words; sq/sk are the per-row scales
 extern "C" __global__ void attn_int8(const int* __restrict__ q8, const float* __restrict__ sq,
                                      const int* __restrict__ k8, const float* __restrict__ sk,
                                      const half_t* __restrict__ v, half_t* __restrict__ out,
@@ -65,21 +67,15 @@ extern "C" __global__ void attn_int8(const int* __restrict__ q8, const float* __
         const int r = idx / DW, w = idx - r * DW;
         qs[r * QSTR + w] = (q0 + r < T) ? q8[(hoff + q0 + r) * DW + w] : 0;
     }
-    for (int r = tid; r < BQ; r += NTH) {
-        sqs[r] = (q0 + r < T) ? sq[hoff + q0 + r] : 0.0f;
-        ms[r] = NEG;
-        ls[r] = 0.0f;
-    }
+    for (int r = tid; r < BQ; r += NTH) { sqs[r] = (q0 + r < T) ? sq[hoff + q0 + r] : 0.0f; ms[r] = NEG; ls[r] = 0.0f; }
 
-    float acc[32];
+    float acc[2 * CP2];
     #pragma unroll
-    for (int u = 0; u < 32; ++u) acc[u] = 0.0f;
+    for (int u = 0; u < 2 * CP2; ++u) acc[u] = 0.0f;
 
-    const int row = tid >> 2;          // 0..BQ-1, the query this thread works on
-    const int grp = tid & 3;           // 0..3
-    const int jc = grp * JPT;          // its slice of the score tile
-    const int pc = grp;                // interleaved columns: grp, grp+4, ... so the four
-                                       // lanes of a row never land in the same shared bank
+    const int row = tid / L;
+    const int grp = tid % L;
+    const int jc = grp * JPT;
     __syncthreads();
 
     for (int k0 = 0; k0 < T; k0 += BK) {
@@ -111,11 +107,8 @@ extern "C" __global__ void attn_int8(const int* __restrict__ q8, const float* __
             pv[u] = (k0 + jc + u < T) ? (float)ai[u] * rs * sks[jc + u] : NEG;
             mx = pv[u] > mx ? pv[u] : mx;
         }
-        // every lane of the group of four must reach the shuffle, so no calling it inside a branch
-        float o1 = __shfl_xor_sync(0xffffffffu, mx, 1);
-        mx = o1 > mx ? o1 : mx;
-        float o2 = __shfl_xor_sync(0xffffffffu, mx, 2);
-        mx = o2 > mx ? o2 : mx;
+        #pragma unroll
+        for (int m = 1; m < L; m <<= 1) { float o = __shfl_xor_sync(0xffffffffu, mx, m); mx = o > mx ? o : mx; }
 
         const float mold = ms[row];
         const float mnew = mx > mold ? mx : mold;
@@ -123,30 +116,21 @@ extern "C" __global__ void attn_int8(const int* __restrict__ q8, const float* __
 
         float sum = 0.0f;
         #pragma unroll
-        for (int u = 0; u < JPT; ++u) {
-            const float e = __expf(pv[u] - mnew);
-            ss[row * BK + jc + u] = e;
-            sum += e;
-        }
-        sum += __shfl_xor_sync(0xffffffffu, sum, 1);
-        sum += __shfl_xor_sync(0xffffffffu, sum, 2);
-
-        if (grp == 0) {
-            ms[row] = mnew;
-            ls[row] = ls[row] * corr + sum;
-        }
+        for (int u = 0; u < JPT; ++u) { const float e = __expf(pv[u] - mnew); ss[row * BK + jc + u] = e; sum += e; }
         #pragma unroll
-        for (int u = 0; u < 32; ++u) acc[u] *= corr;
+        for (int m = 1; m < L; m <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, m);
+
+        if (grp == 0) { ms[row] = mnew; ls[row] = ls[row] * corr + sum; }
+        #pragma unroll
+        for (int u = 0; u < 2 * CP2; ++u) acc[u] *= corr;
         __syncthreads();
 
         for (int j = 0; j < BK; ++j) {
             const float p = ss[row * BK + j];
-            // one 32-bit load per two columns: half the shared traffic, and the four lanes of a
-            // row read four consecutive words, so no bank conflict
-            const unsigned* vr = (const unsigned*)(vs + j * VSTR) + pc;
+            const unsigned* vr = (const unsigned*)(vs + j * VSTR) + grp;
             #pragma unroll
-            for (int u = 0; u < 16; ++u) {
-                const unsigned w = vr[4 * u];
+            for (int u = 0; u < CP2; ++u) {
+                const unsigned w = vr[L * u];
                 acc[2 * u] += p * h2f((half_t)(w & 0xffffu));
                 acc[2 * u + 1] += p * h2f((half_t)(w >> 16));
             }
@@ -156,10 +140,10 @@ extern "C" __global__ void attn_int8(const int* __restrict__ q8, const float* __
 
     if (q0 + row < T) {
         const float inv = 1.0f / ls[row];
-        unsigned* o = (unsigned*)(out + (hoff + q0 + row) * DD) + pc;
+        unsigned* o = (unsigned*)(out + (hoff + q0 + row) * DD) + grp;
         #pragma unroll
-        for (int u = 0; u < 16; ++u)
-            o[4 * u] = (unsigned)f2h(acc[2 * u] * inv) | ((unsigned)f2h(acc[2 * u + 1] * inv) << 16);
+        for (int u = 0; u < CP2; ++u)
+            o[L * u] = (unsigned)f2h(acc[2 * u] * inv) | ((unsigned)f2h(acc[2 * u + 1] * inv) << 16);
     }
 }
 """
