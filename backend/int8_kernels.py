@@ -179,6 +179,8 @@ def available() -> bool:
             try:
                 _state["ready"] = _build()
                 logger.info("Using fused int8 quantise / rescale kernels")
+            except ImportError:  # the launcher installs it for --int8-linear / --int8-cache, the dropdown cannot
+                logger.warning("Fused int8 kernels need `pip install cuda-python`; using the PyTorch path")
             except Exception as e:
                 logger.warning(f"Fused int8 kernels unavailable ({type(e).__name__}: {e}); using the PyTorch path")
     return _state["ready"]

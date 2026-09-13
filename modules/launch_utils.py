@@ -322,6 +322,7 @@ def prepare_environment():
         torch_command = os.environ.get("TORCH_COMMAND", f"pip install torch==2.13.0+cu130 torchvision==0.28.0+cu130 --extra-index-url {torch_index_url}")
     xformers_package = os.environ.get("XFORMERS_PACKAGE", f"xformers==0.0.35 --extra-index-url {torch_index_url}")
     pynvml_package = os.environ.get("PYNVML_PACKAGE", "nvidia-ml-py==13.610.43")
+    cuda_python_package = os.environ.get("CUDA_PYTHON_PACKAGE", "cuda-python==13.4.1")
 
     packaging_package = os.environ.get("PACKAGING_PACKAGE", "packaging==26.2")
     gradio_package = os.environ.get("GRADIO_PACKAGE", "gradio==4.40.0 gradio_rangeslider==0.0.8")
@@ -447,6 +448,15 @@ if cuda:
     if args.pynvml and not is_installed("pynvml"):
         run_pip(f"install {pynvml_package}", "pynvml")
         startup_timer.record("install pynvml")
+
+    # NVRTC bindings for the fused int8 kernels; without them the int8 path still runs, just unfused
+    if (args.int8_linear or args.int8_cache) and not is_installed("cuda-python"):
+        try:
+            run_pip(f"install {cuda_python_package}", "cuda-python")
+        except RuntimeError:
+            print("Failed to install cuda-python; the int8 kernels will fall back to the PyTorch path")
+        else:
+            startup_timer.record("install cuda-python")
 
     if args.ngrok and not is_installed("ngrok"):
         run_pip("install ngrok", "ngrok")
