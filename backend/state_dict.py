@@ -4,14 +4,14 @@ import torch
 
 
 def load_state_dict(model: torch.nn.Module, sd: dict[str, torch.Tensor], ignore_errors: list[str] = [], log_name: str = None, ignore_start: str = None):
-    from backend.operations_nf4 import pack_4bit_parameters
+    from backend.operations_nf4 import ParameterNF4, pack_4bit_parameters
 
     pack_4bit_parameters(sd)
     is_meta = any(p.is_meta for p in model.parameters())
 
     if is_meta:
         for name, param in [*model.named_parameters(), *model.named_buffers()]:
-            if (entry := sd.get(name, None)) is not None and entry.dtype != param.dtype:
+            if (entry := sd.get(name, None)) is not None and entry.dtype != param.dtype and not isinstance(entry, ParameterNF4):
                 sd[name] = entry.to(param.dtype)
 
     missing, unexpected = model.load_state_dict(sd, strict=False, assign=is_meta)
