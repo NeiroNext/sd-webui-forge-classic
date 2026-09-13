@@ -354,7 +354,7 @@ def int8_linear(x: torch.Tensor, weight: ParameterInt8, bias: torch.Tensor, laye
 
         if g:
             xb = rotate(xb, g)
-        s_x = xb.abs().amax(dim=1).float().clamp_min_(1e-8) / 127.0
+        s_x = torch.linalg.vector_norm(xb, torch.inf, dim=1, dtype=torch.float32).clamp_min_(1e-8) / 127.0
         x8 = torch.round(xb.float() * (1.0 / s_x)[:, None]).clamp_(-127, 127).to(torch.int8)
         ob = torch._int_mm(x8, w8)[: j - i] * s_x[: j - i, None]  # the int32 sum is exact, the scaling must stay fp32
         ob.mul_(s_w[None, :])
