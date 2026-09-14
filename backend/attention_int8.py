@@ -6,7 +6,13 @@ has to be written out (1.2 GB per call), and a PyTorch-level tiled attention is 
 the fused fp16 SDPA. Inside a kernel the int32 accumulator never leaves the registers, so the dp4a
 rate is the only thing that matters. Compiled with NVRTC like backend/int8_kernels.py - no toolkit.
 
-Not wired into the model; `self_test()` is the entry point.
+What made it finally beat SDPA is NOT the int8: an ablation (scratchpad/attn_ablate.py) showed dp4a
+costs nothing at all here, and 71% of the time went into the V path - staging it, converting it from
+fp16 and multiplying it - because one thread owned one query row, so every element loaded from
+shared fed exactly one multiply. RR rows per thread make the same load feed RR multiplies at no
+extra register cost: a block always holds BQ*DD accumulators, and only their shape changes.
+
+Not wired into the model; `self_test()` is the only entry point.
 """
 
 import logging
@@ -19,9 +25,9 @@ from backend.logging import setup_logger
 logger = logging.getLogger("int8")
 setup_logger(logger)
 
-# the winning point of a 288-configuration sweep (scratchpad/attn_tune.py)
-BQ, BK, DD, KPAD, VPAD = 32, 16, 128, 2, 4
-NTH = 128
+# the winning point of scratchpad/attn_tune2.py, which swept the rows-per-thread axis as well
+BQ, BK, NTH, LC, KPAD, VPAD, DD = 64, 32, 128, 8, 2, 4, 128
+RR = BQ // (NTH // LC)
 
 SOURCE = r"""
 typedef unsigned short half_t;
@@ -31,17 +37,20 @@ __device__ __forceinline__ int dp4(int a, int b, int c) {
     int d; asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c)); return d;
 }
 
-#define BQ 32
-#define BK 16
+#define BQ 64
+#define BK 32
 #define NTH 128
+#define LC 8
 #define DD 128
 #define DW (DD/4)
 #define QSTR (DW+2)
 #define KSTR (DW+2)
 #define VSTR (DD+4)
-#define L (NTH/BQ)
-#define JPT (BK/L)
-#define CP2 (DD/(2*L))
+#define NR (NTH/LC)
+#define RR (BQ/NR)
+#define CPT (DD/LC)
+#define CP2 (CPT/2)
+#define JPT (BK/LC)
 #define NEG -1e30f
 
 extern "C" __global__ void attn_int8(const int* __restrict__ q8, const float* __restrict__ sq,
@@ -69,13 +78,14 @@ extern "C" __global__ void attn_int8(const int* __restrict__ q8, const float* __
     }
     for (int r = tid; r < BQ; r += NTH) { sqs[r] = (q0 + r < T) ? sq[hoff + q0 + r] : 0.0f; ms[r] = NEG; ls[r] = 0.0f; }
 
-    float acc[2 * CP2];
-    #pragma unroll
-    for (int u = 0; u < 2 * CP2; ++u) acc[u] = 0.0f;
+    const int rg = tid / LC;      /* row group: owns rows rg, rg+NR, rg+2*NR, ... */
+    const int g = tid % LC;       /* lane: owns columns g, g+LC, ... and keys g, g+LC, ... */
 
-    const int row = tid / L;
-    const int grp = tid % L;
-    const int jc = grp * JPT;
+    float acc[RR][2 * CP2];
+    #pragma unroll
+    for (int i = 0; i < RR; ++i)
+        #pragma unroll
+        for (int u = 0; u < 2 * CP2; ++u) acc[i][u] = 0.0f;
     __syncthreads();
 
     for (int k0 = 0; k0 < T; k0 += BK) {
@@ -90,65 +100,93 @@ extern "C" __global__ void attn_int8(const int* __restrict__ q8, const float* __
         for (int r = tid; r < BK; r += NTH) sks[r] = (k0 + r < T) ? sk[hoff + k0 + r] : 0.0f;
         __syncthreads();
 
-        int ai[JPT];
+        int ai[RR][JPT];
         #pragma unroll
-        for (int u = 0; u < JPT; ++u) ai[u] = 0;
-        for (int w = 0; w < DW; ++w) {
-            const int qv = qs[row * QSTR + w];
+        for (int i = 0; i < RR; ++i)
             #pragma unroll
-            for (int u = 0; u < JPT; ++u) ai[u] = dp4(qv, ks[(jc + u) * KSTR + w], ai[u]);
+            for (int u = 0; u < JPT; ++u) ai[i][u] = 0;
+
+        for (int w = 0; w < DW; ++w) {
+            int qv[RR], kv[JPT];
+            #pragma unroll
+            for (int i = 0; i < RR; ++i) qv[i] = qs[(rg + NR * i) * QSTR + w];
+            #pragma unroll
+            for (int u = 0; u < JPT; ++u) kv[u] = ks[(g + LC * u) * KSTR + w];
+            #pragma unroll
+            for (int i = 0; i < RR; ++i)
+                #pragma unroll
+                for (int u = 0; u < JPT; ++u) ai[i][u] = dp4(qv[i], kv[u], ai[i][u]);
         }
 
-        const float rs = sqs[row] * scale;
-        float mx = NEG;
-        float pv[JPT];
         #pragma unroll
-        for (int u = 0; u < JPT; ++u) {
-            pv[u] = (k0 + jc + u < T) ? (float)ai[u] * rs * sks[jc + u] : NEG;
-            mx = pv[u] > mx ? pv[u] : mx;
+        for (int i = 0; i < RR; ++i) {
+            const int row = rg + NR * i;
+            const float rs = sqs[row] * scale;
+            float pv[JPT];
+            float mx = NEG;
+            #pragma unroll
+            for (int u = 0; u < JPT; ++u) {
+                const int key = g + LC * u;
+                pv[u] = (k0 + key < T) ? (float)ai[i][u] * rs * sks[key] : NEG;
+                mx = pv[u] > mx ? pv[u] : mx;
+            }
+            #pragma unroll
+            for (int m = 1; m < LC; m <<= 1) { float o = __shfl_xor_sync(0xffffffffu, mx, m); mx = o > mx ? o : mx; }
+
+            const float mold = ms[row];
+            const float mnew = mx > mold ? mx : mold;
+            const float corr = __expf(mold - mnew);
+
+            float sum = 0.0f;
+            #pragma unroll
+            for (int u = 0; u < JPT; ++u) {
+                const float e = __expf(pv[u] - mnew);
+                ss[row * BK + g + LC * u] = e;
+                sum += e;
+            }
+            #pragma unroll
+            for (int m = 1; m < LC; m <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, m);
+
+            if (g == 0) { ms[row] = mnew; ls[row] = ls[row] * corr + sum; }
+            #pragma unroll
+            for (int u = 0; u < 2 * CP2; ++u) acc[i][u] *= corr;
         }
-        #pragma unroll
-        for (int m = 1; m < L; m <<= 1) { float o = __shfl_xor_sync(0xffffffffu, mx, m); mx = o > mx ? o : mx; }
-
-        const float mold = ms[row];
-        const float mnew = mx > mold ? mx : mold;
-        const float corr = __expf(mold - mnew);
-
-        float sum = 0.0f;
-        #pragma unroll
-        for (int u = 0; u < JPT; ++u) { const float e = __expf(pv[u] - mnew); ss[row * BK + jc + u] = e; sum += e; }
-        #pragma unroll
-        for (int m = 1; m < L; m <<= 1) sum += __shfl_xor_sync(0xffffffffu, sum, m);
-
-        if (grp == 0) { ms[row] = mnew; ls[row] = ls[row] * corr + sum; }
-        #pragma unroll
-        for (int u = 0; u < 2 * CP2; ++u) acc[u] *= corr;
         __syncthreads();
 
         for (int j = 0; j < BK; ++j) {
-            const float p = ss[row * BK + j];
-            const unsigned* vr = (const unsigned*)(vs + j * VSTR) + grp;
+            const unsigned* vr = (const unsigned*)(vs + j * VSTR) + g;
+            unsigned wv[CP2];
             #pragma unroll
-            for (int u = 0; u < CP2; ++u) {
-                const unsigned w = vr[L * u];
-                acc[2 * u] += p * h2f((half_t)(w & 0xffffu));
-                acc[2 * u + 1] += p * h2f((half_t)(w >> 16));
+            for (int u = 0; u < CP2; ++u) wv[u] = vr[LC * u];
+            #pragma unroll
+            for (int i = 0; i < RR; ++i) {
+                const float p = ss[(rg + NR * i) * BK + j];
+                #pragma unroll
+                for (int u = 0; u < CP2; ++u) {
+                    acc[i][2 * u] += p * h2f((half_t)(wv[u] & 0xffffu));
+                    acc[i][2 * u + 1] += p * h2f((half_t)(wv[u] >> 16));
+                }
             }
         }
         __syncthreads();
     }
 
-    if (q0 + row < T) {
-        const float inv = 1.0f / ls[row];
-        unsigned* o = (unsigned*)(out + (hoff + q0 + row) * DD) + grp;
-        #pragma unroll
-        for (int u = 0; u < CP2; ++u)
-            o[L * u] = (unsigned)f2h(acc[2 * u] * inv) | ((unsigned)f2h(acc[2 * u + 1] * inv) << 16);
+    #pragma unroll
+    for (int i = 0; i < RR; ++i) {
+        const int row = rg + NR * i;
+        if (q0 + row < T) {
+            const float inv = 1.0f / ls[row];
+            unsigned* o = (unsigned*)(out + (hoff + q0 + row) * DD) + g;
+            #pragma unroll
+            for (int u = 0; u < CP2; ++u)
+                o[LC * u] = (unsigned)f2h(acc[i][2 * u] * inv) | ((unsigned)f2h(acc[i][2 * u + 1] * inv) << 16);
+        }
     }
 }
 """
 
-SMEM = (BQ * (DD // 4 + 1) + BK * (DD // 4 + 1)) * 4 + (BQ * BK + BQ + BK + BQ + BQ) * 4 + BK * (DD + 8) * 2
+SMEM = ((BQ * (DD // 4 + KPAD) + BK * (DD // 4 + KPAD)) * 4
+        + (BQ * BK + BQ + BK + BQ + BQ) * 4 + BK * (DD + VPAD) * 2)
 _state = {"fn": None, "args": None}
 
 
@@ -189,9 +227,11 @@ def ready() -> bool:
 
 
 def quantize_rows(x: torch.Tensor):
-    s = x.abs().amax(dim=2).float().clamp_min(1e-8) / 127.0
-    q = torch.round(x.float() / s[..., None]).clamp_(-127, 127).to(torch.int8)
-    return q.contiguous(), s.contiguous()
+    from backend import int8_kernels
+
+    h, t, d = x.shape
+    q, s = int8_kernels.quantize_rows(x.reshape(h * t, d))
+    return q, s.reshape(h, t)
 
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -224,5 +264,6 @@ def self_test(T: int = 3584, H: int = 24):
     got = attention(q, k, v)
     torch.cuda.synchronize()
     err = (got.float() - ref.float()).norm() / ref.float().norm()
-    print(f"shared memory {SMEM} B, grid {(T + BQ - 1) // BQ}x{H}, relative error vs SDPA {err:.3e}")
+    print(f"shared memory {SMEM} B, grid {(T + BQ - 1) // BQ}x{H}, {RR} query rows per thread, "
+          f"relative error vs SDPA {err:.3e}")
     return err
