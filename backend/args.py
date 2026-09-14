@@ -101,6 +101,7 @@ parser.add_argument("--autotune", action="store_true", help="torch.backends.cudn
 parser.add_argument("--int8-linear", action="store_true", help="int8 GEMM (torch._int_mm) for the Linear layers of Flux / Chroma / Z-Image ; LoRA as a side branch")
 parser.add_argument("--int8-cache", action="store_true", help="--int8-linear, with the int8 weights kept in models/int8 and mapped instead of quantised into RAM at every load")
 parser.add_argument("--int8-attention", action="store_true", help="int8 attention kernel for the 128-wide heads of Flux / Chroma / Z-Image ; anything else keeps the stock path")
+parser.add_argument("--fused-rope", action="store_true", help="one kernel for the rotary embedding of Flux / Chroma / Z-Image instead of the eager cast to fp32 and back ; bit-identical")
 
 parser.add_argument("--mmap-torch-files", action="store_true", help="Use mmap when loading ckpt/pt files")
 parser.add_argument("--disable-mmap", action="store_true", help="Don't use mmap when loading safetensors")

@@ -126,6 +126,51 @@ extern "C" __global__ void quant_rows_narrow(const uint2* __restrict__ x, unsign
     }
 }
 
+// RoPE. x [.., tokens, .., D] half with the D axis contiguous, freqs [.., tokens, .., D/2, 2, 2]
+// float, out like x. One block per token tile: the tile's freqs are read into shared once and reused
+// across every head, otherwise they weigh four times the data they rotate. D/2 == RD2.
+#define RD2 64
+#define RTILE 8
+
+extern "C" __global__ void rope_pair(const unsigned* __restrict__ qi, const unsigned* __restrict__ ki,
+                                     const float4* __restrict__ fr,
+                                     unsigned* __restrict__ qo, unsigned* __restrict__ ko,
+                                     int H, int L, long long bi, long long hi, long long lin,
+                                     long long fb, long long bo, long long ho, long long lou) {
+    __shared__ float4 fs[RTILE * RD2];
+
+    const int b = blockIdx.y;
+    const int l0 = blockIdx.x * RTILE;
+    const int nl = min(RTILE, L - l0);
+
+    for (int i = threadIdx.x; i < nl * RD2; i += blockDim.x)
+        fs[i] = fr[(long long)b * fb + (long long)(l0 + (i >> 6)) * RD2 + (i & (RD2 - 1))];
+    __syncthreads();
+
+    const int p = threadIdx.x & (RD2 - 1);
+    const int nrg = blockDim.x >> 6;
+
+    for (int hl = threadIdx.x >> 6; hl < H * nl; hl += nrg) {
+        const int h = hl / nl;
+        const int li = hl - h * nl;
+        const long long si = ((long long)b * bi + (long long)h * hi + (long long)(l0 + li) * lin) * RD2 + p;
+        const long long so = ((long long)b * bo + (long long)h * ho + (long long)(l0 + li) * lou) * RD2 + p;
+        const float4 f = fs[li * RD2 + p];
+
+        // torch rounds f0*x0 and f1*x1 separately and then adds them; the intrinsics stop nvcc from
+        // contracting that into an fma, which moves one ulp on a couple of elements in ten thousand
+        unsigned w = qi[si];
+        float x0 = h2f((half_t)(w & 0xffffu)), x1 = h2f((half_t)(w >> 16));
+        qo[so] = (unsigned)f2h(__fadd_rn(__fmul_rn(f.x, x0), __fmul_rn(f.y, x1)))
+               | ((unsigned)f2h(__fadd_rn(__fmul_rn(f.z, x0), __fmul_rn(f.w, x1))) << 16);
+
+        w = ki[si];
+        x0 = h2f((half_t)(w & 0xffffu)); x1 = h2f((half_t)(w >> 16));
+        ko[so] = (unsigned)f2h(__fadd_rn(__fmul_rn(f.x, x0), __fmul_rn(f.y, x1)))
+               | ((unsigned)f2h(__fadd_rn(__fmul_rn(f.z, x0), __fmul_rn(f.w, x1))) << 16);
+    }
+}
+
 // acc [rows, N] int32 -> out [rows, N] half, scaled by the row and the output channel, N % 4 == 0
 extern "C" __global__ void rescale_rows(const int* __restrict__ acc, const float* __restrict__ sx,
                                         const float* __restrict__ sw, const half_t* __restrict__ bias,
@@ -157,7 +202,9 @@ extern "C" __global__ void rescale_rows(const int* __restrict__ acc, const float
 
 TPB = 256
 NARROW_K = int(os.environ.get("INT8_NARROW_K", "1024"))
-_state = {"ready": None, "quant": None, "quant_narrow": None, "rescale": None, "args": {}}
+RTILE = 8
+_state = {"ready": None, "quant": None, "quant_narrow": None, "rescale": None,
+          "rope": None, "args": {}}
 
 
 def _cubin(arch: str) -> bytes:
@@ -199,14 +246,15 @@ def _build() -> bool:
     err, mod = cu.cuModuleLoadData(cubin)
     assert err == cu.CUresult.CUDA_SUCCESS, err
     for key, name in (("quant", b"quant_rows"), ("quant_narrow", b"quant_rows_narrow"),
-                      ("rescale", b"rescale_rows")):
+                      ("rescale", b"rescale_rows"), ("rope", b"rope_pair")):
         err, fn = cu.cuModuleGetFunction(mod, name)
         assert err == cu.CUresult.CUDA_SUCCESS, err
         _state[key] = fn
     _state["module"] = mod  # keep the module alive, the functions point into it
 
     # the driver copies the argument values at launch, so one scratch buffer per kernel is enough
-    for key, spec in (("quant", "QQQi"), ("quant_narrow", "QQQii"), ("rescale", "QQQQQii")):
+    for key, spec in (("quant", "QQQi"), ("quant_narrow", "QQQii"), ("rescale", "QQQQQii"),
+                      ("rope", "QQQQQiiQQQQQQQ")):
         bufs = [np.zeros(1, dtype=np.uint64 if c == "Q" else np.int32) for c in spec]
         ptrs = np.array([b.ctypes.data for b in bufs], dtype=np.uint64)
         _state["args"][key] = (bufs, ptrs, ptrs.ctypes.data)
@@ -255,6 +303,39 @@ def quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     s = torch.linalg.vector_norm(x, torch.inf, dim=1, dtype=torch.float32).clamp_min_(1e-8) / 127.0
     return torch.round(x.float() * (1.0 / s)[:, None]).clamp_(-127, 127).to(torch.int8), s
+
+
+def apply_rope(xq: torch.Tensor, xk: torch.Tensor, freqs: torch.Tensor):
+    """Rotate q and k in one pass. Returns None for anything the kernel cannot take, so the caller
+    keeps whatever it was using; comfy-kitchen's eager version casts to fp32 and back and peaks at
+    five times the tensor it rotates."""
+    if not (available() and xq.dtype is torch.float16 and xk.dtype is xq.dtype and xq.is_cuda
+            and xq.shape == xk.shape and xq.stride() == xk.stride() and xq.dim() == 4
+            and freqs.dim() == 6 and freqs.dtype is torch.float32 and freqs.is_contiguous()
+            and freqs.shape[-1] == 2 and freqs.shape[-2] == 2 and freqs.shape[-3] * 2 == xq.shape[-1]
+            and freqs.shape[-3] == 64 and xq.stride(-1) == 1):
+        return None
+
+    d = xq.shape[-1]
+    # the token axis is the one the freqs actually index; the other of dims 1 and 2 broadcasts
+    axis = next((i for i in (2, 1) if freqs.shape[i] == xq.shape[i] and freqs.shape[i] > 1), None)
+    if axis is None or freqs.shape[3 - axis] != 1 or freqs.shape[0] not in (1, xq.shape[0]):
+        return None
+    head = 3 - axis
+    si = [xq.stride(0), xq.stride(1), xq.stride(2)]
+    if any(st % d for st in si):  # q and k are permuted views of one qkv, so only the D axis is dense
+        return None
+
+    b, ln, hn = xq.shape[0], xq.shape[axis], xq.shape[head]
+    oq = torch.empty(xq.shape, dtype=xq.dtype, device=xq.device)
+    ok = torch.empty(xq.shape, dtype=xq.dtype, device=xq.device)
+    so = [oq.stride(0), oq.stride(1), oq.stride(2)]
+    _launch("rope", ((ln + RTILE - 1) // RTILE, b),
+            xq.data_ptr(), xk.data_ptr(), freqs.data_ptr(), oq.data_ptr(), ok.data_ptr(),
+            hn, ln, si[0] // d, si[head] // d, si[axis] // d,
+            0 if freqs.shape[0] == 1 else ln * (d // 2),
+            so[0] // d, so[head] // d, so[axis] // d)
+    return oq, ok
 
 
 def rescale(acc: torch.Tensor, s_x: torch.Tensor, s_w: torch.Tensor, bias: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:

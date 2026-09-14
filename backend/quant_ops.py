@@ -23,6 +23,17 @@ else:
 
 from backend.args import args
 
+if args.fused_rope:  # the eager one casts fp16 to fp32, multiplies, addcmul_s and casts back
+    from backend import int8_kernels as _ik
+
+    _eager_rope = ck.apply_rope
+
+    def _fused_rope(xq, xk, freqs_cis):
+        out = _ik.apply_rope(xq, xk, freqs_cis)
+        return out if out is not None else _eager_rope(xq, xk, freqs_cis)
+
+    ck.apply_rope = _fused_rope
+
 if args.enable_triton_backend:
     try:
         import triton  # noqa

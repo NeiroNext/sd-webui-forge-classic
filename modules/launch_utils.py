@@ -450,7 +450,7 @@ if cuda:
         startup_timer.record("install pynvml")
 
     # NVRTC bindings for the fused int8 kernels; without them the int8 path still runs, just unfused
-    if (args.int8_linear or args.int8_cache or args.int8_attention) and not is_installed("cuda-python"):
+    if (args.int8_linear or args.int8_cache or args.int8_attention or args.fused_rope) and not is_installed("cuda-python"):
         try:
             run_pip(f"install {cuda_python_package}", "cuda-python")
         except RuntimeError:
