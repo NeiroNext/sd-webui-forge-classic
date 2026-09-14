@@ -437,6 +437,13 @@ else:
     logger.info("Using Basic Cross Attention")
     attention_function = attention_basic
 
+if args.int8_attention:
+    from backend import attention_int8
+
+    if attention_int8.available():
+        logger.info("Using int8 Attention for 128-wide heads")
+        attention_function = attention_int8.wrap(attention_function)
+
 
 # region VAE
 

@@ -1,20 +1,25 @@
 """
-EXPERIMENT (branch int8-attn): a flash-style attention kernel with the QK^T product in int8.
+Flash-style attention with the QK^T product in int8, for the 128-wide heads of Flux / Chroma / Z-Image.
 
-Why a kernel at all: `torch._int_mm` on QK^T is only 1.59x over fp16 because the int32 score matrix
-has to be written out (1.2 GB per call), and a PyTorch-level tiled attention is 1.5-2x SLOWER than
-the fused fp16 SDPA. Inside a kernel the int32 accumulator never leaves the registers, so the dp4a
-rate is the only thing that matters. Compiled with NVRTC like backend/int8_kernels.py - no toolkit.
+`torch._int_mm` on QK^T is only 1.59x over fp16 because the int32 score matrix has to be written out,
+and a tiled attention in plain PyTorch is 1.5-2x SLOWER than the fused fp16 kernel. Inside a kernel
+the int32 accumulator never leaves the registers. What makes it win is not the int8 though: dp4a
+costs nothing measurable here, and the time goes into feeding the multipliers, so each thread owns
+several query rows and every element of V read from shared memory feeds that many multiplies. That
+costs no extra registers - a block always holds BQ*DD accumulators, only their shape changes.
 
-What made it finally beat SDPA is NOT the int8: an ablation (scratchpad/attn_ablate.py) showed dp4a
-costs nothing at all here, and 71% of the time went into the V path - staging it, converting it from
-fp16 and multiplying it - because one thread owned one query row, so every element loaded from
-shared fed exactly one multiply. RR rows per thread make the same load feed RR multiplies at no
-extra register cost: a block always holds BQ*DD accumulators, and only their shape changes.
+Measured on a GTX 1070 against the fused fp16 kernel that runs otherwise, at the real shapes:
+Chroma x1.40 and x1.22, Flux x1.22, Z-Image x1.21 and x1.18, and x1.30 at the hires token count.
+The error is the cost of quantising Q and K and nothing else - over one step of each model the kernel
+lands within 1e-05 of quantise-and-back through the stock kernel - and Q and K carry no outliers
+after RoPE, so a per-row absmax scale needs no rotation.
 
-Not wired into the model; `self_test()` is the only entry point.
+Compiled at runtime with NVRTC, so no host compiler and no CUDA toolkit are needed, only the driver.
+Anything this cannot take - a mask, a custom scale, GQA, another head width, another dtype, a batch -
+goes to the implementation it wraps, and so does everything if the kernel fails to build or to run.
 """
 
+import hashlib
 import logging
 import os
 
@@ -25,9 +30,15 @@ from backend.logging import setup_logger
 logger = logging.getLogger("int8")
 setup_logger(logger)
 
-# the winning point of scratchpad/attn_tune2.py, which swept the rows-per-thread axis as well
+ENABLED = os.environ.get("INT8_ATTN", "1") != "0"
+
+# the winning point of a sweep over the tile sizes, the block size, the shared padding AND the number
+# of query rows per thread (320 configurations): best per rows-per-thread 1 -> 0.76 of the fp16
+# kernel, 2 -> 1.10, 4 -> 1.30, 8 -> 1.29, 16 -> 1.16, 32 -> 0.81
 BQ, BK, NTH, LC, KPAD, VPAD, DD = 64, 32, 128, 8, 2, 4, 128
 RR = BQ // (NTH // LC)
+SMEM = ((BQ * (DD // 4 + KPAD) + BK * (DD // 4 + KPAD)) * 4
+        + (BQ * BK + BQ + BK + BQ + BQ) * 4 + BK * (DD + VPAD) * 2)
 
 SOURCE = r"""
 typedef unsigned short half_t;
@@ -37,15 +48,15 @@ __device__ __forceinline__ int dp4(int a, int b, int c) {
     int d; asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c)); return d;
 }
 
-#define BQ 64
-#define BK 32
-#define NTH 128
-#define LC 8
+#define BQ __BQ__
+#define BK __BK__
+#define NTH __NTH__
+#define LC __LC__
 #define DD 128
 #define DW (DD/4)
-#define QSTR (DW+2)
-#define KSTR (DW+2)
-#define VSTR (DD+4)
+#define QSTR (DW+__KPAD__)
+#define KSTR (DW+__KPAD__)
+#define VSTR (DD+__VPAD__)
 #define NR (NTH/LC)
 #define RR (BQ/NR)
 #define CPT (DD/LC)
@@ -130,6 +141,7 @@ extern "C" __global__ void attn_int8(const int* __restrict__ q8, const float* __
                 pv[u] = (k0 + key < T) ? (float)ai[i][u] * rs * sks[key] : NEG;
                 mx = pv[u] > mx ? pv[u] : mx;
             }
+            /* every lane of the group must reach the shuffle, so it cannot be called inside a branch */
             #pragma unroll
             for (int m = 1; m < LC; m <<= 1) { float o = __shfl_xor_sync(0xffffffffu, mx, m); mx = o > mx ? o : mx; }
 
@@ -183,22 +195,24 @@ extern "C" __global__ void attn_int8(const int* __restrict__ q8, const float* __
         }
     }
 }
-"""
+""".replace("__BQ__", str(BQ)).replace("__BK__", str(BK)).replace("__NTH__", str(NTH)) \
+   .replace("__LC__", str(LC)).replace("__KPAD__", str(KPAD)).replace("__VPAD__", str(VPAD))
 
-SMEM = ((BQ * (DD // 4 + KPAD) + BK * (DD // 4 + KPAD)) * 4
-        + (BQ * BK + BQ + BK + BQ + BQ) * 4 + BK * (DD + VPAD) * 2)
-_state = {"fn": None, "args": None}
+_state = {"ready": None, "fn": None}
 
 
-def _build():
-    import numpy as np
-    from cuda.bindings import driver as cu
+def _cubin(arch: str) -> bytes:
     from cuda.bindings import nvrtc
 
-    major, minor = torch.cuda.get_device_capability()
+    digest = hashlib.sha256(SOURCE.encode()).hexdigest()[:16]
+    path = os.path.join(torch.hub.get_dir(), "int8_kernels", f"attn_{digest}_{arch}.cubin")
+    if os.path.isfile(path):
+        with open(path, "rb") as f:
+            return f.read()
+
     err, prog = nvrtc.nvrtcCreateProgram(SOURCE.encode(), b"attn.cu", 0, [], [])
     assert err == nvrtc.nvrtcResult.NVRTC_SUCCESS, err
-    opts = [f"--gpu-architecture=sm_{major}{minor}".encode(), b"--std=c++17"]
+    opts = [f"--gpu-architecture={arch}".encode(), b"--std=c++17"]
     if nvrtc.nvrtcCompileProgram(prog, len(opts), opts)[0] != nvrtc.nvrtcResult.NVRTC_SUCCESS:
         log = bytearray(nvrtc.nvrtcGetProgramLogSize(prog)[1])
         nvrtc.nvrtcGetProgramLog(prog, log)
@@ -207,45 +221,59 @@ def _build():
     nvrtc.nvrtcGetCUBIN(prog, blob)
     nvrtc.nvrtcDestroyProgram(prog)
 
-    torch.zeros(1, device="cuda")
-    err, mod = cu.cuModuleLoadData(bytes(blob))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(blob)
+    os.replace(tmp, path)
+    return bytes(blob)
+
+
+def _build() -> bool:
+    import numpy as np
+    from cuda.bindings import driver as cu
+
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) < (6, 1):  # dp4a
+        return False
+    cubin = _cubin(f"sm_{major}{minor}")
+
+    torch.zeros(1, device="cuda")  # the primary context must be current before the driver API is used
+    err, mod = cu.cuModuleLoadData(cubin)
     assert err == cu.CUresult.CUDA_SUCCESS, err
     err, fn = cu.cuModuleGetFunction(mod, b"attn_int8")
     assert err == cu.CUresult.CUDA_SUCCESS, err
 
-    bufs = [np.zeros(1, dtype=d) for d in
-            (np.uint64, np.uint64, np.uint64, np.uint64, np.uint64, np.uint64, np.int32, np.float32)]
+    bufs = [np.zeros(1, dtype=d) for d in (np.uint64,) * 6 + (np.int32, np.float32)]
     ptrs = np.array([b.ctypes.data for b in bufs], dtype=np.uint64)
     _state.update(fn=fn, module=mod, cu=cu, bufs=bufs, addr=ptrs.ctypes.data, ptrs=ptrs)
     return True
 
 
-def ready() -> bool:
-    if _state["fn"] is None:
-        _build()
-    return True
-
-
-def quantize_rows(x: torch.Tensor):
-    from backend import int8_kernels
-
-    h, t, d = x.shape
-    q, s = int8_kernels.quantize_rows(x.reshape(h * t, d))
-    return q, s.reshape(h, t)
+def available() -> bool:
+    if _state["ready"] is None:
+        _state["ready"] = False
+        if ENABLED and torch.cuda.is_available():
+            try:
+                _state["ready"] = _build()
+            except ImportError:
+                logger.warning("int8 attention needs `pip install cuda-python`; using the stock attention")
+            except Exception as e:
+                logger.warning(f"int8 attention unavailable ({type(e).__name__}: {e}); using the stock attention")
+    return _state["ready"]
 
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """q, k, v: [heads, tokens, 128] fp16"""
-    ready()
-    H, T, D = q.shape
-    assert D == DD and q.dtype == torch.float16
-    q8, sq = quantize_rows(q)
-    k8, sk = quantize_rows(k)
-    v = v.contiguous()
+    """q, k, v: [heads, tokens, 128] fp16 and contiguous, returns the same"""
+    from backend import int8_kernels
+
+    H, T, _ = q.shape
+    q8, s_q = int8_kernels.quantize_rows(q.view(H * T, DD))
+    k8, s_k = int8_kernels.quantize_rows(k.view(H * T, DD))
     out = torch.empty_like(q)
 
-    for b, val in zip(_state["bufs"], (q8.data_ptr(), sq.data_ptr(), k8.data_ptr(), sk.data_ptr(),
-                                       v.data_ptr(), out.data_ptr(), T, D ** -0.5)):
+    for b, val in zip(_state["bufs"], (q8.data_ptr(), s_q.data_ptr(), k8.data_ptr(), s_k.data_ptr(),
+                                       v.data_ptr(), out.data_ptr(), T, DD ** -0.5)):
         b[0] = val
     cu = _state["cu"]
     err = cu.cuLaunchKernel(_state["fn"], (T + BQ - 1) // BQ, H, 1, NTH, 1, 1, SMEM,
@@ -255,15 +283,56 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor
     return out
 
 
+def wrap(fallback):
+    """Return an attention function that takes what the kernel can and hands everything else on."""
+
+    def attention_int8(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+        if (_state["ready"] and skip_reshape and mask is None and q.dtype is torch.float16 and q.is_cuda
+                and kwargs.get("scale") is None and not kwargs.get("enable_gqa")
+                and q.shape[0] == 1 and q.shape[1] == heads and q.shape[3] == DD
+                and k.shape == q.shape and v.shape == q.shape):
+            try:
+                out = attention(q[0].contiguous(), k[0].contiguous(), v[0].contiguous())
+                if skip_output_reshape:
+                    return out.unsqueeze(0)
+                return out.transpose(0, 1).reshape(1, q.shape[2], heads * DD)
+            except Exception as e:
+                _state["ready"] = False
+                logger.warning(f"int8 attention failed ({type(e).__name__}: {e}); using the stock attention from now on")
+        return fallback(q, k, v, heads, mask, attn_precision, skip_reshape, skip_output_reshape, **kwargs)
+
+    return attention_int8
+
+
 def self_test(T: int = 3584, H: int = 24):
     import torch.nn.functional as F
 
+    from backend.attention import attention_pytorch
+
+    if not available():
+        print("int8 attention is not available here")
+        return None
+
     torch.manual_seed(0)
-    q, k, v = (torch.randn(H, T, DD, device="cuda", dtype=torch.float16) * 0.3 for _ in range(3))
-    ref = F.scaled_dot_product_attention(q[None], k[None], v[None])[0]
-    got = attention(q, k, v)
-    torch.cuda.synchronize()
-    err = (got.float() - ref.float()).norm() / ref.float().norm()
-    print(f"shared memory {SMEM} B, grid {(T + BQ - 1) // BQ}x{H}, {RR} query rows per thread, "
-          f"relative error vs SDPA {err:.3e}")
-    return err
+    q, k, v = (torch.randn(1, H, T, DD, device="cuda", dtype=torch.float16) * 0.3 for _ in range(3))
+    ref = F.scaled_dot_product_attention(q, k, v)
+    fn = wrap(attention_pytorch)
+    for keep in (True, False):
+        got = fn(q, k, v, H, skip_reshape=True, skip_output_reshape=keep)
+        torch.cuda.synchronize()
+        r = ref if keep else ref.transpose(1, 2).reshape(1, T, H * DD)
+        err = (got.float() - r.float()).norm() / r.float().norm()
+        print(f"skip_output_reshape={keep}: shape {tuple(got.shape)}, relative error vs SDPA {err:.3e}")
+
+    # everything the kernel must refuse; each has to come back from the fallback with the right shape
+    for name, call in (
+        ("a mask", lambda: fn(q, k, v, H, mask=torch.zeros(T, T, device="cuda", dtype=torch.float16), skip_reshape=True)),
+        ("a custom scale", lambda: fn(q, k, v, H, skip_reshape=True, scale=0.5)),
+        ("bf16", lambda: fn(*(t.bfloat16() for t in (q, k, v)), H, skip_reshape=True)),
+        ("head dim 64", lambda: fn(*(t[..., :64].contiguous() for t in (q, k, v)), H, skip_reshape=True)),
+        ("batch 2", lambda: fn(*(t.repeat(2, 1, 1, 1) for t in (q, k, v)), H, skip_reshape=True)),
+        ("no skip_reshape", lambda: fn(*(t.transpose(1, 2).reshape(1, T, H * DD) for t in (q, k, v)), H)),
+    ):
+        print(f"refused {name}: fell back, shape {tuple(call().shape)}")
+    print(f"shared memory {SMEM} B, {RR} query rows per thread")
+    return True
