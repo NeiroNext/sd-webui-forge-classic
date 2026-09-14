@@ -75,7 +75,7 @@ __device__ __forceinline__ int dp4(int a, int b, int c) {
 extern "C" __global__ void attn_int8(const int* __restrict__ q8, const float* __restrict__ sq,
                                      const int* __restrict__ k8, const float* __restrict__ sk,
                                      const half_t* __restrict__ v, half_t* __restrict__ out,
-                                     int T, float scale) {
+                                     int T, float scale, int vhs, int vls) {
     extern __shared__ int smem[];
     int* qs = smem;
     int* ks = qs + BQ * QSTR;
@@ -112,9 +112,11 @@ extern "C" __global__ void attn_int8(const int* __restrict__ q8, const float* __
             const int r = idx / DW, w = idx - r * DW;
             ks[r * KSTR + w] = (k0 + r < T) ? k8[(hoff + k0 + r) * DW + w] : 0;
         }
+        /* V may be a strided slice of the fused qkv, so it is addressed by its own two strides */
         for (int idx = tid; idx < BK * DD; idx += NTH) {
             const int r = idx / DD, c = idx - r * DD;
-            vs[r * VSTR + c] = (k0 + r < T) ? v[(hoff + k0 + r) * DD + c] : (half_t)0;
+            vs[r * VSTR + c] = (k0 + r < T)
+                ? v[(long long)h * vhs + (long long)(k0 + r) * vls + c] : (half_t)0;
         }
         for (int r = tid; r < BK; r += NTH) sks[r] = (k0 + r < T) ? sk[hoff + k0 + r] : 0.0f;
         __syncthreads();
@@ -252,7 +254,8 @@ def _build() -> bool:
     err, fn = cu.cuModuleGetFunction(mod, b"attn_int8")
     assert err == cu.CUresult.CUDA_SUCCESS, err
 
-    bufs = [np.zeros(1, dtype=d) for d in (np.uint64,) * 6 + (np.int32, np.float32)]
+    bufs = [np.zeros(1, dtype=d) for d in
+            (np.uint64,) * 6 + (np.int32, np.float32, np.int32, np.int32)]
     ptrs = np.array([b.ctypes.data for b in bufs], dtype=np.uint64)
     _state.update(fn=fn, module=mod, cu=cu, bufs=bufs, addr=ptrs.ctypes.data, ptrs=ptrs)
     return True
@@ -272,16 +275,19 @@ def available() -> bool:
 
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """q, k, v: [heads, tokens, 128] fp16 and contiguous, returns the same"""
+    """q, k, v: [heads, tokens, 128] fp16 with the last axis contiguous, returns a contiguous one"""
     from backend import int8_kernels
 
     H, T, _ = q.shape
-    q8, s_q = int8_kernels.quantize_rows(q.view(H * T, DD))
-    k8, s_k = int8_kernels.quantize_rows(k.view(H * T, DD))
-    out = torch.empty_like(q)
+    q8, s_q = int8_kernels.quantize_heads(q)
+    k8, s_k = int8_kernels.quantize_heads(k)
+    if v.stride(2) != 1:
+        v = v.contiguous()
+    out = torch.empty(H, T, DD, dtype=q.dtype, device=q.device)
 
     for b, val in zip(_state["bufs"], (q8.data_ptr(), s_q.data_ptr(), k8.data_ptr(), s_k.data_ptr(),
-                                       v.data_ptr(), out.data_ptr(), T, DD ** -0.5)):
+                                       v.data_ptr(), out.data_ptr(), T, DD ** -0.5,
+                                       v.stride(0), v.stride(1))):
         b[0] = val
     cu = _state["cu"]
     err = cu.cuLaunchKernel(_state["fn"], (T + BQ - 1) // BQ, H, 1, NTH, 1, 1, SMEM,
@@ -298,9 +304,9 @@ def wrap(fallback):
         if (_state["ready"] and skip_reshape and mask is None and q.dtype is torch.float16 and q.is_cuda
                 and kwargs.get("scale") is None and not kwargs.get("enable_gqa")
                 and q.shape[0] == 1 and q.shape[1] == heads and q.shape[3] == DD
-                and k.shape == q.shape and v.shape == q.shape):
+                and k.shape == q.shape and v.shape == q.shape and q.stride(3) == 1):
             try:
-                out = attention(q[0].contiguous(), k[0].contiguous(), v[0].contiguous())
+                out = attention(q[0], k[0], v[0])
                 if skip_output_reshape:
                     return out.unsqueeze(0)
                 return out.transpose(0, 1).reshape(1, q.shape[2], heads * DD)

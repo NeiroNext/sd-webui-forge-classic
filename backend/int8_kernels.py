@@ -89,12 +89,17 @@ extern "C" __global__ void quant_rows(const uint4* __restrict__ x, uint2* __rest
 // warp exactly. One block per row leaves 240 of 256 threads idle there and pays two barriers for a
 // reduction over 16 values. K % 4 == 0; the result is identical, absmax does not depend on the order.
 extern "C" __global__ void quant_rows_narrow(const uint2* __restrict__ x, unsigned* __restrict__ out,
-                                             float* __restrict__ scale, int K4, int rows) {
+                                             float* __restrict__ scale, int K4, int H, int T,
+                                             int hs, int ts) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
+    const long long rows = (long long)H * T;
 
+    // the input rows may be a strided view - attention hands over q and k as permuted slices of one
+    // fused projection - while the output and the scales are always packed
     for (long long r = (long long)blockIdx.x * NWARP + warp; r < rows; r += (long long)gridDim.x * NWARP) {
-        const uint2* xr = x + r * K4;
+        const int h = (int)(r / T);
+        const uint2* xr = x + (long long)h * hs + (long long)(r - (long long)h * T) * ts;
         unsigned* orow = out + r * K4;
 
         float m = 0.0f;
@@ -253,7 +258,7 @@ def _build() -> bool:
     _state["module"] = mod  # keep the module alive, the functions point into it
 
     # the driver copies the argument values at launch, so one scratch buffer per kernel is enough
-    for key, spec in (("quant", "QQQi"), ("quant_narrow", "QQQii"), ("rescale", "QQQQQii"),
+    for key, spec in (("quant", "QQQi"), ("quant_narrow", "QQQiiiii"), ("rescale", "QQQQQii"),
                       ("rope", "QQQQQiiQQQQQQQ")):
         bufs = [np.zeros(1, dtype=np.uint64 if c == "Q" else np.int32) for c in spec]
         ptrs = np.array([b.ctypes.data for b in bufs], dtype=np.uint64)
@@ -296,7 +301,8 @@ def quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         scale = torch.empty(rows, dtype=torch.float32, device=x.device)
         if k <= NARROW_K:  # a block per row wastes most of its threads on a short row
             blocks = min((rows + TPB // 32 - 1) // (TPB // 32), 8192)
-            _launch("quant_narrow", (blocks, 1), x.data_ptr(), out.data_ptr(), scale.data_ptr(), k // 4, rows)
+            _launch("quant_narrow", (blocks, 1), x.data_ptr(), out.data_ptr(), scale.data_ptr(),
+                    k // 4, 1, rows, 0, k // 4)
         else:
             _launch("quant", (rows, 1), x.data_ptr(), out.data_ptr(), scale.data_ptr(), k // 8)
         return out, scale
@@ -336,6 +342,26 @@ def apply_rope(xq: torch.Tensor, xk: torch.Tensor, freqs: torch.Tensor):
             0 if freqs.shape[0] == 1 else ln * (d // 2),
             so[0] // d, so[head] // d, so[axis] // d)
     return oq, ok
+
+
+def quantize_heads(x: torch.Tensor):
+    """x [heads, tokens, K] fp16 with K contiguous and any head / token stride -> packed int8 and scales.
+
+    Attention gets q and k as permuted slices of one fused qkv projection, so making them contiguous
+    first is a full copy of each per call - 2.2 GB a forward on NextDiT, which puts all three of
+    q / k / v in that shape. The kernel walks the strides instead."""
+    h, t, k = x.shape
+    if not (available() and x.dtype == torch.float16 and k % 8 == 0 and k <= NARROW_K
+            and x.stride(2) == 1 and x.stride(0) % 4 == 0 and x.stride(1) % 4 == 0 and h * t > 0):
+        x = x.reshape(h * t, k) if x.is_contiguous() else x.contiguous().view(h * t, k)
+        return quantize_rows(x)
+
+    out = torch.empty(h * t, k, dtype=torch.int8, device=x.device)
+    scale = torch.empty(h * t, dtype=torch.float32, device=x.device)
+    blocks = min((h * t + TPB // 32 - 1) // (TPB // 32), 8192)
+    _launch("quant_narrow", (blocks, 1), x.data_ptr(), out.data_ptr(), scale.data_ptr(),
+            k // 4, h, t, x.stride(0) // 4, x.stride(1) // 4)
+    return out, scale
 
 
 def rescale(acc: torch.Tensor, s_x: torch.Tensor, s_w: torch.Tensor, bias: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
