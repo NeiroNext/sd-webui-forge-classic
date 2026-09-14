@@ -9,10 +9,18 @@ several query rows and every element of V read from shared memory feeds that man
 costs no extra registers - a block always holds BQ*DD accumulators, only their shape changes.
 
 Measured on a GTX 1070 against the fused fp16 kernel that runs otherwise, at the real shapes:
-Chroma x1.40 and x1.22, Flux x1.22, Z-Image x1.21 and x1.18, and x1.30 at the hires token count.
+Chroma x1.40 and x1.22, Flux x1.22, Z-Image x1.21 and x1.18, x1.30 at the hires token count. A step
+is not all attention, so end to end that is low-to-mid single digits - Flux and Z-Image ~6-7%, Chroma
+4.7%, and hires only ~2%, where the isolated ratio is highest: the hires pass streams the same weights
+and its Linear layers grow with the tokens too, so attention weighs less there than the shape alone
+suggests. Hires does NOT page with this on, which was the one real risk (38.7 vs 42.4 s/it worst
+step, against the >60 that means the driver is paging).
+
 The error is the cost of quantising Q and K and nothing else - over one step of each model the kernel
 lands within 1e-05 of quantise-and-back through the stock kernel - and Q and K carry no outliers
-after RoPE, so a per-row absmax scale needs no rotation.
+after RoPE, so a per-row absmax scale needs no rotation. Against its own stock output a finished
+image is 43.9 dB on Flux, 32.4 on hires, 31.5 on Chroma and 30.7 on Z-Image, the last two lower
+because CFG 4 and an 8-step schedule both amplify a perturbation into a small geometric shift.
 
 Compiled at runtime with NVRTC, so no host compiler and no CUDA toolkit are needed, only the driver.
 Anything this cannot take - a mask, a custom scale, GQA, another head width, another dtype, a batch -
