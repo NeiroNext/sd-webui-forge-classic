@@ -85,6 +85,47 @@ extern "C" __global__ void quant_rows(const uint4* __restrict__ x, uint2* __rest
     }
 }
 
+// The same for NARROW rows: a warp per row and uint2 loads, so the 128-wide rows of attention fill a
+// warp exactly. One block per row leaves 240 of 256 threads idle there and pays two barriers for a
+// reduction over 16 values. K % 4 == 0; the result is identical, absmax does not depend on the order.
+extern "C" __global__ void quant_rows_narrow(const uint2* __restrict__ x, unsigned* __restrict__ out,
+                                             float* __restrict__ scale, int K4, int rows) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    for (long long r = (long long)blockIdx.x * NWARP + warp; r < rows; r += (long long)gridDim.x * NWARP) {
+        const uint2* xr = x + r * K4;
+        unsigned* orow = out + r * K4;
+
+        float m = 0.0f;
+        for (int i = lane; i < K4; i += 32) {
+            uint2 p = xr[i];
+            const half_t* h = (const half_t*)&p;
+            #pragma unroll
+            for (int t = 0; t < 4; ++t) m = fmaxf(m, fabsf(h2f(h[t])));
+        }
+        #pragma unroll
+        for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+
+        const float s = fmaxf(m, 1e-8f) * (float)(1.0 / 127.0);
+        if (lane == 0) scale[r] = s;
+        const float inv = 1.0f / s;
+
+        for (int i = lane; i < K4; i += 32) {
+            uint2 p = xr[i];
+            const half_t* h = (const half_t*)&p;
+            unsigned q;
+            signed char* o = (signed char*)&q;
+            #pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                float v = rintf(h2f(h[t]) * inv);
+                o[t] = (signed char)fminf(fmaxf(v, -127.0f), 127.0f);
+            }
+            orow[i] = q;
+        }
+    }
+}
+
 // acc [rows, N] int32 -> out [rows, N] half, scaled by the row and the output channel, N % 4 == 0
 extern "C" __global__ void rescale_rows(const int* __restrict__ acc, const float* __restrict__ sx,
                                         const float* __restrict__ sw, const half_t* __restrict__ bias,
@@ -115,7 +156,8 @@ extern "C" __global__ void rescale_rows(const int* __restrict__ acc, const float
 """
 
 TPB = 256
-_state = {"ready": None, "quant": None, "rescale": None, "args": {}}
+NARROW_K = int(os.environ.get("INT8_NARROW_K", "1024"))
+_state = {"ready": None, "quant": None, "quant_narrow": None, "rescale": None, "args": {}}
 
 
 def _cubin(arch: str) -> bytes:
@@ -156,14 +198,15 @@ def _build() -> bool:
     torch.zeros(1, device="cuda")  # the primary context must be current before the driver API is used
     err, mod = cu.cuModuleLoadData(cubin)
     assert err == cu.CUresult.CUDA_SUCCESS, err
-    for key, name in (("quant", b"quant_rows"), ("rescale", b"rescale_rows")):
+    for key, name in (("quant", b"quant_rows"), ("quant_narrow", b"quant_rows_narrow"),
+                      ("rescale", b"rescale_rows")):
         err, fn = cu.cuModuleGetFunction(mod, name)
         assert err == cu.CUresult.CUDA_SUCCESS, err
         _state[key] = fn
     _state["module"] = mod  # keep the module alive, the functions point into it
 
     # the driver copies the argument values at launch, so one scratch buffer per kernel is enough
-    for key, spec in (("quant", "QQQi"), ("rescale", "QQQQQii")):
+    for key, spec in (("quant", "QQQi"), ("quant_narrow", "QQQii"), ("rescale", "QQQQQii")):
         bufs = [np.zeros(1, dtype=np.uint64 if c == "Q" else np.int32) for c in spec]
         ptrs = np.array([b.ctypes.data for b in bufs], dtype=np.uint64)
         _state["args"][key] = (bufs, ptrs, ptrs.ctypes.data)
@@ -203,7 +246,11 @@ def quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if available() and x.dtype == torch.float16 and x.is_contiguous() and k % 8 == 0 and rows > 0:
         out = torch.empty(rows, k, dtype=torch.int8, device=x.device)
         scale = torch.empty(rows, dtype=torch.float32, device=x.device)
-        _launch("quant", (rows, 1), x.data_ptr(), out.data_ptr(), scale.data_ptr(), k // 8)
+        if k <= NARROW_K:  # a block per row wastes most of its threads on a short row
+            blocks = min((rows + TPB // 32 - 1) // (TPB // 32), 8192)
+            _launch("quant_narrow", (blocks, 1), x.data_ptr(), out.data_ptr(), scale.data_ptr(), k // 4, rows)
+        else:
+            _launch("quant", (rows, 1), x.data_ptr(), out.data_ptr(), scale.data_ptr(), k // 8)
         return out, scale
 
     s = torch.linalg.vector_norm(x, torch.inf, dim=1, dtype=torch.float32).clamp_min_(1e-8) / 127.0
